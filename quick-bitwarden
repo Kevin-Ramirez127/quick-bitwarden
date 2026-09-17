@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set -uo pipefail
+umask 077
+
+readonly VERSION=1.0.0
+readonly BASE=${QBW_BASE:-/tmp/qbw}
+readonly SESSION_FILE=$BASE/s
+readonly CTL=$BASE/ctl
+readonly PID_FILE=$BASE/pid
+readonly MENU_PID_FILE=$BASE/menu.pid
+readonly SEL_FILE=$BASE/sel
+readonly CLEAR_AFTER=20
+readonly REFRESH_INTERVAL=${QBW_REFRESH_INTERVAL:-30}
+
+V_MENU=""
+V_TSV=""
+V_PASS=""
+LAST_REFRESH=0
+
+die() {
+    echo "quick-bitwarden: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: quick-bitwarden [COMMAND] [OPTION]
+
+A quick Bitwarden vault CLI backed by a menu-driven daemon.
+
+Commands:
+  show           Open the item picker (copies the selected password)
+  hide           Close the picker menu if open
+  toggle         Open the picker if closed, close it if open (default)
+  stop           Stop the background daemon
+  status         Show daemon and vault status
+  --daemon       Run in the background as the daemon (internal)
+
+Options:
+  -h, --help     Show this help and exit
+  -v, --version  Print version and exit
+
+Environment:
+  QBW_BASE              Runtime directory (default: /tmp/qbw)
+  QBW_REFRESH_INTERVAL  Cache refresh interval in seconds (default: 30)
+EOF
+}
+
+require() {
+    command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+error_dialog() {
+    local msg=$1
+    if command -v rofi >/dev/null 2>&1; then
+        rofi -e "$msg"
+    elif command -v zenity >/dev/null 2>&1; then
+        zenity --error --text="$msg" 2>/dev/null
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send -u critical "quick-bitwarden" "$msg"
+    else
+        printf '%s\n' "quick-bitwarden: $msg" >"$BASE/error.log"
+    fi
+    return 0
+}
+
+ask_password() {
+    local label=$1 out pid pw
+    out=$(mktemp)
+    if command -v rofi >/dev/null 2>&1; then
+        rofi -dmenu -password -p "$label" >"$out" 2>/dev/null &
+    elif command -v zenity >/dev/null 2>&1; then
+        zenity --password --title="$label" >"$out" 2>/dev/null &
+    elif command -v wofi >/dev/null 2>&1; then
+        wofi --dmenu --prompt "$label" >"$out" 2>/dev/null &
+    else
+        rm -f "$out"
+        return 1
+    fi
+    pid=$!
+    printf '%s\n' "$pid" >"$MENU_PID_FILE"
+    wait "$pid" 2>/dev/null || true
+    rm -f "$MENU_PID_FILE"
+    pw=$(cat "$out" 2>/dev/null)
+    rm -f "$out"
+    [[ -n $pw ]] && printf '%s' "$pw"
+}
+
+copy_password() {
+    local pw=$1
+    if command -v wl-copy >/dev/null 2>&1; then
+        printf '%s' "$pw" | wl-copy
+    elif command -v xclip >/dev/null 2>&1; then
+        printf '%s' "$pw" | xclip -selection clipboard
+    elif command -v xsel >/dev/null 2>&1; then
+        printf '%s' "$pw" | xsel --clipboard --input
+    else
+        return 1
+    fi
+}
+
+remove_from_history() {
+    local pw=$1
+    command -v cliphist >/dev/null 2>&1 || return 0
+    local i
+    for i in 1 2 3; do
+        cliphist list 2>/dev/null | grep -F -- "$pw" | cliphist delete >/dev/null 2>&1 || true
+        sleep 0.7
+    done
+}
+
+clear_password() {
+    sleep "$CLEAR_AFTER"
+    if command -v wl-copy >/dev/null 2>&1; then
+        wl-copy -c
+    elif command -v xclip >/dev/null 2>&1; then
+        xclip -selection clipboard /dev/null
+    elif command -v xsel >/dev/null 2>&1; then
+        xsel --clipboard --input </dev/null
+    fi 2>/dev/null || true
+}
+
+daemon_alive() {
+    [[ -f $PID_FILE ]] || return 1
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
+    [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null
+}
+
+menu_open() {
+    [[ -f $MENU_PID_FILE ]] || return 1
+    local pid
+    pid=$(cat "$MENU_PID_FILE" 2>/dev/null) || return 1
+    [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null
+}
+
+launch_menu() {
+    local menu=$1
+    if [[ -n ${WAYLAND_DISPLAY:-} ]] && command -v wofi >/dev/null 2>&1; then
+        printf '%s\n' "$menu" | wofi --dmenu --prompt "Search" --insensitive >"$SEL_FILE" 2>/dev/null &
+    elif command -v rofi >/dev/null 2>&1; then
+        printf '%s\n' "$menu" | rofi -dmenu -p "Search" -i >"$SEL_FILE" 2>/dev/null &
+    elif command -v wofi >/dev/null 2>&1; then
+        printf '%s\n' "$menu" | wofi --dmenu --prompt "Search" --insensitive >"$SEL_FILE" 2>/dev/null &
+    else
+        error_dialog "rofi or wofi not found"
+        return 1
+    fi
+
+    local menu_pid=$!
+    printf '%s\n' "$menu_pid" >"$MENU_PID_FILE"
+    wait "$menu_pid" 2>/dev/null || true
+    rm -f "$MENU_PID_FILE"
+    return 0
+}
+
+ensure_unlocked() {
+    local status password token
+    if [[ -f $SESSION_FILE ]]; then
+        BW_SESSION=$(cat "$SESSION_FILE")
+        export BW_SESSION
+    fi
+
+    status=$(bw status --raw 2>/dev/null | jq -r '.status // "unauthenticated"' 2>/dev/null || echo unauthenticated)
+
+    case "$status" in
+        unlocked)
+            return 0
+            ;;
+        locked)
+            password=$(ask_password "Master password") || return 1
+            [[ -n $password ]] || return 1
+            if ! token=$(bw unlock "$password" --raw 2>/dev/null); then
+                error_dialog "Could not unlock the vault: wrong master password?"
+                return 1
+            fi
+            printf '%s' "$token" >"$SESSION_FILE"
+            export BW_SESSION=$token
+            ;;
+        unauthenticated)
+            error_dialog "Not logged in. Run 'bw login' first."
+            return 1
+            ;;
+        *)
+            error_dialog "Unexpected bw status: $status"
+            return 1
+            ;;
+    esac
+}
+
+refresh_cache() {
+    local json
+    json=$(bw list items 2>/dev/null) || return 1
+
+    V_TSV=$(jq -r '
+        .[]
+        | select(.type == 1 and ((.name // "") != ""))
+        | .name as $n
+        | (.login.username // "") as $u
+        | (if ($u != "") then ($n + "  (" + $u + ")") else $n end) as $label
+        | $label + "\t" + .id' <<<"$json")
+
+    V_MENU=$(printf '%s\n' "$V_TSV" | cut -f1)
+
+    V_PASS=$(jq -r '
+        .[]
+        | select(.type == 1)
+        | select((.login.password // "") != "")
+        | .id + "\t" + (.login.password // "")' <<<"$json")
+}
+
+refresh_if_stale() {
+    local now
+    now=$(date +%s)
+    (( now - LAST_REFRESH >= REFRESH_INTERVAL )) || return 0
+    ensure_unlocked || return 0
+    if refresh_cache; then
+        LAST_REFRESH=$now
+    fi
+}
+
+do_show() {
+    local selection id password
+    if [[ -z ${V_MENU:-} ]]; then
+        ensure_unlocked || return 0
+        refresh_cache
+    fi
+
+    if [[ -z $V_MENU ]]; then
+        error_dialog "No login items in the vault"
+        return 0
+    fi
+
+    launch_menu "$V_MENU" || return 0
+
+    selection=$(cat "$SEL_FILE" 2>/dev/null)
+    rm -f "$SEL_FILE"
+    [[ -n $selection ]] || return 0
+
+    id=$(awk -F'\t' -v s="$selection" '$1 == s { print $2; exit }' <<<"$V_TSV")
+
+    if [[ -n $id ]]; then
+        password=$(awk -F'\t' -v i="$id" '$1 == i { print $2; exit }' <<<"$V_PASS")
+    fi
+
+    if [[ -z $password ]]; then
+        if [[ -n $id ]]; then
+            password=$(bw get password "$id" 2>/dev/null) || true
+        else
+            password=$(bw get password "$selection" 2>/dev/null) || true
+        fi
+        [[ -n $password ]] || {
+            error_dialog "Could not fetch password for '$selection'"
+            return 0
+        }
+    fi
+
+    copy_password "$password" || {
+        error_dialog "Clipboard tool missing (wl-copy, xclip or xsel)"
+        return 0
+    }
+
+    ( remove_from_history "$password" ) &
+    ( clear_password ) &
+
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -t 3000 "quick-bitwarden" "Copied: ${selection%%  (*} (clears in ${CLEAR_AFTER}s)"
+    fi
+}
+
+cleanup_stale() {
+    if [[ -f $MENU_PID_FILE ]]; then
+        local pid
+        pid=$(cat "$MENU_PID_FILE" 2>/dev/null) || true
+        [[ -n $pid ]] && kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$CTL" "$PID_FILE" "$MENU_PID_FILE" "$SEL_FILE"
+}
+
+run_daemon() {
+    require bw
+    require jq
+
+    mkdir -p "$BASE"
+    cleanup_stale
+    printf '%s\n' "$$" >"$PID_FILE"
+    rm -f "$CTL"
+    mkfifo "$CTL"
+
+    trap 'rm -f "$CTL" "$PID_FILE" "$MENU_PID_FILE" "$SEL_FILE"; exit 0' TERM INT EXIT
+
+    exec 3<>"$CTL"
+
+    ensure_unlocked
+    refresh_cache
+    LAST_REFRESH=$(date +%s)
+
+    while :; do
+        if IFS= read -r cmd <&3; then
+            if [[ $cmd == show ]]; then
+                do_show
+                refresh_if_stale
+            elif [[ $cmd == stop ]]; then
+                exit 0
+            fi
+        fi
+    done
+}
+
+send_cmd() {
+    [[ -p $CTL ]] || die "daemon not running"
+    printf '%s\n' "$1" >"$CTL"
+}
+
+ensure_daemon() {
+    if daemon_alive; then
+        return 0
+    fi
+
+    mkdir -p "$BASE"
+    chmod 700 "$BASE"
+    cleanup_stale
+
+    local self
+    self=$(readlink -f "$0" 2>/dev/null || command -v "$0")
+    [[ -x $self ]] || self=$(command -v "$0")
+
+    if command -v setsid >/dev/null 2>&1; then
+        ( setsid "$self" --daemon </dev/null >/dev/null 2>&1 & ) &
+    else
+        ( nohup "$self" --daemon </dev/null >/dev/null 2>&1 & ) &
+    fi
+    disown 2>/dev/null || true
+
+    local i
+    for ((i = 0; i < 200; i++)); do
+        daemon_alive && [[ -p $CTL ]] && return 0
+        sleep 0.1
+    done
+    die "daemon failed to start (see $BASE/error.log)"
+}
+
+kill_menu() {
+    if menu_open; then
+        local pid
+        pid=$(cat "$MENU_PID_FILE" 2>/dev/null) || return 0
+        kill "$pid" 2>/dev/null || true
+    fi
+}
+
+cmd_toggle() {
+    if menu_open; then
+        kill_menu
+        return 0
+    fi
+    ensure_daemon
+    send_cmd show
+}
+
+cmd_show() {
+    ensure_daemon
+    menu_open && return 0
+    send_cmd show
+}
+
+cmd_hide() {
+    kill_menu
+}
+
+cmd_stop() {
+    if ! daemon_alive; then
+        cleanup_stale
+        echo "quick-bitwarden: not running"
+        return 0
+    fi
+    [[ -p $CTL ]] && printf '%s\n' stop >"$CTL"
+    local i pid
+    for ((i = 0; i < 50; i++)); do
+        daemon_alive || break
+        sleep 0.1
+    done
+    if daemon_alive; then
+        kill_menu
+        pid=$(cat "$PID_FILE" 2>/dev/null) || true
+        [[ -n $pid ]] && kill "$pid" 2>/dev/null || true
+        sleep 0.3
+        [[ -n $pid ]] && kill -9 "$pid" 2>/dev/null || true
+    fi
+    cleanup_stale
+}
+
+cmd_status() {
+    if ! daemon_alive; then
+        echo "quick-bitwarden: daemon not running"
+        return 0
+    fi
+    require bw
+    local status
+    if [[ -f $SESSION_FILE ]]; then
+        export BW_SESSION
+        BW_SESSION=$(cat "$SESSION_FILE")
+    fi
+    status=$(bw status --raw 2>/dev/null | jq -r '.status' 2>/dev/null || echo unknown)
+    echo "quick-bitwarden: daemon running (pid $(cat "$PID_FILE")), vault: $status"
+}
+
+main() {
+    if [[ ${1:-} == --daemon ]]; then
+        run_daemon
+        return 0
+    fi
+
+    local arg=${1:-toggle}
+    case "$arg" in
+        -h|--help) usage ;;
+        -v|--version) echo "quick-bitwarden $VERSION" ;;
+        show) cmd_show ;;
+        hide) cmd_hide ;;
+        toggle) cmd_toggle ;;
+        stop) cmd_stop ;;
+        status) cmd_status ;;
+        *) die "usage: quick-bitwarden [show|hide|toggle|stop|status] (see --help)" ;;
+    esac
+}
+
+main "$@"
