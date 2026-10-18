@@ -167,3 +167,53 @@ pub fn cmd_status(paths: &Paths) {
     let pid = read_pid(&paths.pid).unwrap_or(0);
     println!("quick-bitwarden: daemon running (pid {pid}), vault: {status}");
 }
+
+/// `status --toggle`: report whether the picker is shown or hidden.
+pub fn cmd_status_toggle(paths: &Paths) {
+    println!("quick-bitwarden: {}", toggle_state(paths));
+}
+
+/// `"shown"` while a picker/prompt child is alive, `"hidden"` otherwise.
+pub fn toggle_state(paths: &Paths) -> &'static str {
+    if menu_open(paths) {
+        "shown"
+    } else {
+        "hidden"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::toggle_state;
+    use crate::paths::Paths;
+
+    fn paths_in(base: &std::path::Path) -> Paths {
+        Paths {
+            base: base.to_path_buf(),
+            session: base.join("s"),
+            ctl: base.join("ctl"),
+            pid: base.join("pid"),
+            menu_pid: base.join("menu.pid"),
+            sel: base.join("sel"),
+            clear_after: 20,
+            refresh_interval: 30,
+        }
+    }
+
+    #[test]
+    fn toggle_state_reports_shown_and_hidden() {
+        let base = std::env::temp_dir().join(format!("qbw-toggle-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let paths = paths_in(&base);
+        let _ = std::fs::remove_file(&paths.menu_pid);
+
+        assert_eq!(toggle_state(&paths), "hidden");
+
+        // Our own pid is alive, so a `menu.pid` pointing at it reads as shown.
+        std::fs::write(&paths.menu_pid, format!("{}\n", std::process::id())).unwrap();
+        assert_eq!(toggle_state(&paths), "shown");
+
+        let _ = std::fs::remove_file(&paths.menu_pid);
+        let _ = std::fs::remove_dir(&base);
+    }
+}
