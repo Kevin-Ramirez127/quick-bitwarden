@@ -27,6 +27,7 @@ fn usage() {
          \x20 show           Open the item picker (copies the selected password)\n\
          \x20 hide           Close the picker menu if open\n\
          \x20 toggle         Open the picker if closed, close it if open (default)\n\
+         \x20 sync           Sync the vault and refresh the cache\n\
          \x20 stop           Stop the background daemon\n\
          \x20 status         Show daemon and vault status\n\
          \x20 --daemon       Run in the background as the daemon (internal)\n\
@@ -50,7 +51,7 @@ fn main() {
 
     match args.first().map(String::as_str) {
         Some("--daemon") => daemon::run_daemon(&paths),
-        Some("--menu") => std::process::exit(ui::run_menu_child()),
+        Some("--menu") => std::process::exit(ui::run_menu_child(&paths)),
         Some("--ask") => {
             let label = args.get(1).map(String::as_str).unwrap_or("Master password");
             std::process::exit(ui::run_ask_child(label));
@@ -64,8 +65,9 @@ fn main() {
         Some("show") => commands::cmd_show(&paths),
         Some("hide") => commands::cmd_hide(&paths),
         Some("toggle") | None => commands::cmd_toggle(&paths),
+        Some("sync") => commands::cmd_sync(&paths),
         Some("stop") => commands::cmd_stop(&paths),
         Some("status") => commands::cmd_status(&paths),
-        Some(_) => die("usage: quick-bitwarden [show|hide|toggle|stop|status] (see --help)"),
+        Some(_) => die("usage: quick-bitwarden [show|hide|toggle|sync|stop|status] (see --help)"),
     }
 }

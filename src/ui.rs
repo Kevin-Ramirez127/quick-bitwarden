@@ -126,18 +126,38 @@ pub fn error_dialog(paths: &Paths, msg: &str) {
     }
 }
 
-/// `notify-send -t 3000 ...` after a successful copy.
-pub fn notify_copied(label: &str, clear_after: u64) {
+/// `notify-send -t 3000 "quick-bitwarden" <message>`.
+pub fn notify(message: &str) {
     if command_exists("notify-send") {
         let _ = Command::new("notify-send")
-            .args([
-                "-t",
-                "3000",
-                "quick-bitwarden",
-                &format!("Copied: {label} (clears in {clear_after}s)"),
-            ])
+            .args(["-t", "3000", "quick-bitwarden", message])
             .status();
     }
+}
+
+/// `notify-send -t 3000 ...` after a successful copy.
+pub fn notify_copied(label: &str, clear_after: u64) {
+    notify(&format!("Copied: {label} (clears in {clear_after}s)"));
+}
+
+/// Materialise `$BASE/prefixes.toml` from the embedded template, substituting
+/// `{qbw}` with the running executable. An existing file is left untouched so
+/// it can be customised.
+pub fn write_default_prefixes(paths: &Paths) {
+    let path = paths.prefixes();
+    if path.exists() {
+        return;
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "quick-bitwarden".to_string());
+    let content = include_str!("../prefixes.toml").replace("{qbw}", &shell_quote(&exe));
+    let _ = std::fs::write(path, content);
+}
+
+/// Single-quote a word for `sh -c`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn show_error_via_child(msg: &str) -> bool {
@@ -160,7 +180,7 @@ fn show_error_via_child(msg: &str) -> bool {
 /// The option `id` is set to the label so search stays label-only. Free-typed
 /// input is allowed, so a name absent from the list can still be forwarded to
 /// `bw get password`.
-pub fn run_menu_child() -> i32 {
+pub fn run_menu_child(paths: &Paths) -> i32 {
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         eprintln!("quick-bitwarden: cannot read items");
@@ -182,13 +202,19 @@ pub fn run_menu_child() -> i32 {
         return 2;
     }
 
-    let modal = Modal::new("Search")
+    let mut modal = Modal::new("Search")
         .placeholder("Search")
         .case_sensitive(false)
         .app_id("quick-bitwarden")
         .allow_custom_input(true)
         .footer_hint("Enter copy · Esc cancel")
         .options(options);
+
+    // `>…` query prefixes (e.g. `>s` → sync), materialised by the daemon.
+    let prefixes = paths.prefixes();
+    if prefixes.is_file() {
+        modal = modal.prefixes_file(prefixes);
+    }
 
     match modal.run() {
         Ok(Some(sel)) => {
@@ -244,5 +270,31 @@ pub fn run_error_child(msg: &str) -> i32 {
             eprintln!("quick-bitwarden: {e}");
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quote_wraps_and_escapes() {
+        assert_eq!(shell_quote("/usr/bin/qbw"), "'/usr/bin/qbw'");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn embedded_prefixes_template_parses() {
+        let content = include_str!("../prefixes.toml").replace("{qbw}", "'/bin/quick-bitwarden'");
+        let specs = r_modals::parse_prefixes(&content).expect("template parses");
+        let prefixes: Vec<&str> = specs.iter().map(|s| s.prefix.as_str()).collect();
+        assert_eq!(prefixes, [">sync", ">s"]);
+        assert!(specs
+            .iter()
+            .all(|s| s.shell.as_deref().unwrap().contains("/bin/quick-bitwarden")));
+        assert!(specs
+            .iter()
+            .all(|s| !s.shell.as_deref().unwrap().contains("{qbw}")));
     }
 }

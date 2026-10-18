@@ -29,6 +29,7 @@ pub fn run_daemon(paths: &Paths) {
 
     let _ = std::fs::create_dir_all(&paths.base);
     cleanup_stale(paths);
+    ui::write_default_prefixes(paths);
 
     let _ = std::fs::write(&paths.pid, format!("{}\n", std::process::id()));
 
@@ -75,6 +76,7 @@ pub fn run_daemon(paths: &Paths) {
                     do_show(&mut state, paths);
                     vault::refresh_if_stale(&mut state, paths);
                 }
+                "sync" => do_sync(&mut state, paths),
                 "stop" => break,
                 _ => {}
             },
@@ -149,6 +151,21 @@ fn do_show(state: &mut State, paths: &Paths) {
     }
 
     ui::notify_copied(&short_label(&selection), paths.clear_after);
+}
+
+/// `sync`: run `bw sync`, then rebuild the in-memory cache from the fresh data.
+fn do_sync(state: &mut State, paths: &Paths) {
+    if !vault::ensure_unlocked(state, paths) {
+        return;
+    }
+    if !vault::bw_sync(state.session.as_deref()) {
+        ui::error_dialog(paths, "Could not sync the vault");
+        return;
+    }
+    if vault::refresh_cache(state, paths) {
+        state.last_refresh = proc::now_secs();
+    }
+    ui::notify("Vault synced");
 }
 
 /// `cleanup_stale`: drop any leftover picker and runtime files.

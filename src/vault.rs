@@ -139,6 +139,18 @@ fn bw_unlock(password: &str) -> Option<String> {
     )
 }
 
+/// `bw sync`: pull the latest vault from the server. `true` on success.
+pub fn bw_sync(session: Option<&str>) -> bool {
+    let mut cmd = Command::new("bw");
+    cmd.arg("sync");
+    if let Some(s) = session {
+        cmd.env("BW_SESSION", s);
+    }
+    cmd.output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 /// `refresh_cache`: rebuild the menu/tsv/password tables from `bw list items`.
 /// Returns `false` only when `bw` itself fails.
 pub fn refresh_cache(state: &mut State, paths: &Paths) -> bool {

@@ -62,6 +62,7 @@ quick-bitwarden          # toggle the window (show/hide)
 quick-bitwarden show     # open the search window
 quick-bitwarden hide     # hide it (the daemon keeps running)
 quick-bitwarden toggle   # explains itself
+quick-bitwarden sync     # run `bw sync` and refresh the daemon cache
 quick-bitwarden stop     # stop the daemon (keeps the session in /tmp/qbw/s)
 quick-bitwarden status   # daemon and vault status
 quick-bitwarden --daemon # internal daemon entry point (for system startup)
@@ -77,6 +78,13 @@ quick-bitwarden --help / -h     # list q-bw commands
 - You can also type a name that is not listed and press Enter: it is forwarded
   to `bw get password`.
 
+#### Prefixes
+
+Queries that start with `>` are commands, not item names (defined in
+`$QBW_BASE/prefixes.toml`). Type the prefix and press **Enter**:
+
+- `>sync` / `>s` — run `bw sync` and refresh the daemon cache.
+
 On tiling compositors (sway/Hyprland), float the window via its app id:
 
 ```
@@ -85,8 +93,14 @@ for_window [app_id="quick-bitwarden"] floating enable
 
 ### Sync
 
-The program uses `bw`'s local cache; to see changes from your account run
-`bw sync` (or add it wherever you prefer). The app cache refreshes once
+The program uses `bw`'s local cache. To pull the latest changes from your
+account run one of:
+
+- `quick-bitwarden sync`, or
+- the `>sync` (or `>s`) prefix inside the search window.
+
+Both run `bw sync` and refresh the in-memory cache, so the new items are
+available immediately. The cache also refreshes on its own once
 `QBW_REFRESH_INTERVAL` has elapsed since the last update.
 
 ## Environment variables
@@ -121,6 +135,7 @@ The program uses `bw`'s local cache; to see changes from your account run
 - [x] Starts with system
 - [x] Remove from history clipboard
 - [x] Remove from user's clipboard in 20 seconds by default
+- [x] Sync the vault from the picker (`>sync` / `>s`) or with `quick-bitwarden sync`
 - [ ] Install script
 
 **Flags**

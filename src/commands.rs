@@ -107,6 +107,12 @@ pub fn cmd_hide(paths: &Paths) {
     kill_menu(paths);
 }
 
+/// `sync`: ask the daemon to run `bw sync` and refresh its cache.
+pub fn cmd_sync(paths: &Paths) {
+    ensure_daemon(paths);
+    send_cmd(paths, "sync");
+}
+
 /// `stop`: ask the daemon to exit, forcing it after a grace period.
 pub fn cmd_stop(paths: &Paths) {
     if !daemon_alive(paths) {

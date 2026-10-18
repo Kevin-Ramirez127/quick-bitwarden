@@ -49,6 +49,11 @@ impl Paths {
         self.base.join("error.log")
     }
 
+    /// `$BASE/prefixes.toml` — query prefixes loaded by the picker.
+    pub fn prefixes(&self) -> PathBuf {
+        self.base.join("prefixes.toml")
+    }
+
     /// Remove the runtime files (`ctl`, `pid`, `menu.pid`, `sel`).
     pub fn remove_runtime_files(&self) {
         for p in [&self.ctl, &self.pid, &self.menu_pid, &self.sel] {
