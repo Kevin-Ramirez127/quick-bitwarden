@@ -100,7 +100,8 @@ account run one of:
 - the `>sync` (or `>s`) prefix inside the search window.
 
 Both run `bw sync` and refresh the in-memory cache, so the new items are
-available immediately. The cache also refreshes on its own once
+available immediately. A notification tells you when the sync starts and
+another when it ends. The cache also refreshes on its own once
 `QBW_REFRESH_INTERVAL` has elapsed since the last update.
 
 ## Environment variables

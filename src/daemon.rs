@@ -158,6 +158,8 @@ fn do_sync(state: &mut State, paths: &Paths) {
     if !vault::ensure_unlocked(state, paths) {
         return;
     }
+    // Tell the user a sync started; a second notification follows when it ends.
+    ui::notify("Syncing vault via bw sync… you'll be notified when it ends");
     if !vault::bw_sync(state.session.as_deref()) {
         ui::error_dialog(paths, "Could not sync the vault");
         return;
