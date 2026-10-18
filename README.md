@@ -64,6 +64,7 @@ quick-bitwarden hide     # hide it (the daemon keeps running)
 quick-bitwarden toggle   # explains itself
 quick-bitwarden sync     # run `bw sync` and refresh the daemon cache
 quick-bitwarden stop     # stop the daemon (keeps the session in /tmp/qbw/s)
+quick-bitwarden restart  # restart the daemon (starts it if not running)
 quick-bitwarden status   # daemon and vault status
 quick-bitwarden status --toggle  # whether the picker is shown or hidden
 quick-bitwarden --daemon # internal daemon entry point (for system startup)

@@ -120,7 +120,21 @@ pub fn cmd_stop(paths: &Paths) {
         println!("quick-bitwarden: not running");
         return;
     }
+    stop_daemon(paths);
+}
 
+/// `restart`: cycle the daemon, starting it when it is not running.
+pub fn cmd_restart(paths: &Paths) {
+    if daemon_alive(paths) {
+        stop_daemon(paths);
+    } else {
+        cleanup_stale(paths);
+    }
+    ensure_daemon(paths);
+}
+
+/// `stop_daemon`: end a live daemon (FIFO `stop`, then signals) and clean up.
+fn stop_daemon(paths: &Paths) {
     if is_fifo(&paths.ctl) {
         if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&paths.ctl) {
             let _ = f.write_all(b"stop\n");
