@@ -205,8 +205,14 @@ pub fn run_menu_child() -> i32 {
 }
 
 /// `--ask <label>`: masked text prompt; prints the password on success.
+///
+/// The `Prompt` window is borderless, so the label must be rendered in the body
+/// (`.message`) and as the field hint (`.placeholder`) — the window title alone
+/// is never shown.
 pub fn run_ask_child(label: &str) -> i32 {
     match Prompt::new(label)
+        .message(label)
+        .placeholder(label)
         .password(true)
         .app_id("quick-bitwarden")
         .run()
