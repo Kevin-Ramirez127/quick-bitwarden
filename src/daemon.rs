@@ -56,8 +56,14 @@ pub fn run_daemon(paths: &Paths) {
     let mut reader = BufReader::new(ctl_file);
 
     let mut state = State::default();
-    let _ = vault::ensure_unlocked(&mut state, paths);
-    let _ = vault::refresh_cache(&mut state, paths);
+    // Never prompt at startup. The master-password dialog belongs to `show`;
+    // prompting here would make a cancelled prompt immediately reappear for the
+    // `show` that `ensure_daemon` queued right after starting the daemon.
+    // Warm the cache only when the session is already unlocked.
+    vault::load_session(&mut state, paths);
+    if vault::bw_status(state.session.as_deref()) == "unlocked" {
+        let _ = vault::refresh_cache(&mut state, paths);
+    }
     state.last_refresh = proc::now_secs();
 
     loop {

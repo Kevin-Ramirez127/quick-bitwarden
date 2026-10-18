@@ -82,11 +82,17 @@ pub fn bw_status_status_only(session: Option<&str>) -> String {
     }
 }
 
-/// `ensure_unlocked`: load the session, then unlock/log in as needed.
-pub fn ensure_unlocked(state: &mut State, paths: &Paths) -> bool {
+/// Load the session token file into `state` without contacting the vault or
+/// prompting for anything.
+pub fn load_session(state: &mut State, paths: &Paths) {
     if let Ok(s) = std::fs::read_to_string(&paths.session) {
         state.session = Some(s.trim_end_matches(['\n', '\r']).to_string());
     }
+}
+
+/// `ensure_unlocked`: load the session, then unlock/log in as needed.
+pub fn ensure_unlocked(state: &mut State, paths: &Paths) -> bool {
+    load_session(state, paths);
 
     match bw_status(state.session.as_deref()).as_str() {
         "unlocked" => true,
@@ -199,12 +205,16 @@ pub fn parse_cache(json: &[u8]) -> (String, Vec<(String, String)>, HashMap<Strin
 }
 
 /// `refresh_if_stale`: refresh at most once per `QBW_REFRESH_INTERVAL`.
+///
+/// A background refresh never prompts: the master-password dialog belongs to
+/// `show`. If the session is locked we simply skip — otherwise a `show` that
+/// the user cancelled would immediately re-open the prompt right here.
 pub fn refresh_if_stale(state: &mut State, paths: &Paths) {
     let now = now_secs();
     if now - state.last_refresh < paths.refresh_interval {
         return;
     }
-    if !ensure_unlocked(state, paths) {
+    if bw_status(state.session.as_deref()) != "unlocked" {
         return;
     }
     if refresh_cache(state, paths) {
