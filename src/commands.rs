@@ -141,6 +141,32 @@ pub fn cmd_sync(paths: &Paths) {
     send_cmd(paths, "sync");
 }
 
+/// `lock`: lock the vault and forget the cached session and item data.
+///
+/// The daemon owns both the session token and the cache, so it does the work
+/// when it is running; otherwise this process can lock `bw` directly.
+pub fn cmd_lock(paths: &Paths) {
+    if daemon_alive(paths) {
+        // Close the picker first: the daemon may be blocked serving it, and
+        // a stale window must not keep offering items after the lock.
+        kill_menu(paths);
+        send_cmd(paths, "lock");
+        return;
+    }
+
+    if !command_exists("bw") {
+        crate::die("missing dependency: bw");
+    }
+    let session = std::fs::read_to_string(&paths.session)
+        .ok()
+        .map(|s| s.trim_end_matches(['\n', '\r']).to_string());
+    if !vault::bw_lock(session.as_deref()) {
+        crate::die("could not lock the vault");
+    }
+    let _ = std::fs::remove_file(&paths.session);
+    println!("quick-bitwarden: vault locked");
+}
+
 /// `stop`: ask the daemon to exit, forcing it after a grace period.
 pub fn cmd_stop(paths: &Paths) {
     if !daemon_alive(paths) {

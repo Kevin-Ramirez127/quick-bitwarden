@@ -3002,7 +3002,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "r-modals"
 version = "0.2.0"
-source = "git+https://github.com/Kevin-Ramirez127/r-modals?rev=c70faeb5aa14318bfec6c98a657c939588dde12d#c70faeb5aa14318bfec6c98a657c939588dde12d"
+source = "git+https://github.com/Kevin-Ramirez127/r-modals?rev=130f713c547bf6421decf6f333a9c012d2514d39#130f713c547bf6421decf6f333a9c012d2514d39"
 dependencies = [
  "eframe",
  "egui",

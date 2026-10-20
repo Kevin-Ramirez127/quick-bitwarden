@@ -15,3 +15,13 @@ hint = "Sync the vault"
 prefix = ">s"
 shell = "{qbw} sync"
 hint = "Sync the vault"
+
+[[prefix]]
+prefix = ">lock"
+shell = "{qbw} lock"
+hint = "Lock the vault"
+
+[[prefix]]
+prefix = ">l"
+shell = "{qbw} lock"
+hint = "Lock the vault"
