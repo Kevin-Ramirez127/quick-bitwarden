@@ -288,13 +288,17 @@ fn fetch_cache(session: Option<&str>) -> Option<Cache> {
     if !out.status.success() {
         return None;
     }
-    let (menu, tsv, pass) = parse_cache(&out.stdout);
-    Some(Cache { menu, tsv, pass })
+    // A stale session makes `bw list items` exit 0 with an empty stdout while
+    // it asks for the master password on stderr (stdin is closed here, so the
+    // prompt fails). Treat anything that is not a JSON array as a failed load,
+    // so callers fall back to `bw status` and prompt for the password instead
+    // of reporting an empty vault.
+    parse_cache(&out.stdout)
 }
 
 /// `refresh_cache`: rebuild the menu/tsv/password tables from `bw list items`,
 /// stamping `last_refresh` on success so callers cannot forget to.
-/// Returns `false` only when `bw` itself fails.
+/// Returns `false` when `bw` fails or its output is not a usable item array.
 pub fn refresh_cache(state: &mut State, paths: &Paths) -> bool {
     let _ = paths;
     match fetch_cache(state.session.as_deref()) {
@@ -364,9 +368,13 @@ pub fn start_refresh(state: &State, paths: &Paths) -> Option<BackgroundRefresh> 
 }
 
 /// Pure `bw list items` → `(menu, tsv, id->password)` transform, matching the
-/// `jq` filters of the original script. Invalid JSON yields an empty cache.
-pub fn parse_cache(json: &[u8]) -> (String, Vec<(String, String)>, HashMap<String, String>) {
-    let items: Vec<Item> = serde_json::from_slice(json).unwrap_or_default();
+/// `jq` filters of the original script.
+///
+/// Returns `None` when the output is not a JSON array (e.g. `bw` exited 0 after
+/// failing to read a master password), so the caller can distinguish "the vault
+/// is empty" from "the vault could not be read".
+fn parse_cache(json: &[u8]) -> Option<Cache> {
+    let items: Vec<Item> = serde_json::from_slice(json).ok()?;
 
     let mut tsv: Vec<(String, String)> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
@@ -404,7 +412,11 @@ pub fn parse_cache(json: &[u8]) -> (String, Vec<(String, String)>, HashMap<Strin
         }
     }
 
-    (labels.join("\n"), tsv, pass)
+    Some(Cache {
+        menu: labels.join("\n"),
+        tsv,
+        pass,
+    })
 }
 
 /// `bw get password <id-or-name>` fallback.
@@ -438,29 +450,46 @@ mod tests {
 
     #[test]
     fn parse_cache_builds_menu_tsv_and_passwords() {
-        let (menu, tsv, pass) = parse_cache(ITEMS);
+        let cache = parse_cache(ITEMS).expect("valid vault JSON");
 
-        assert_eq!(menu, "GitHub  (octocat)\nGitLab\nNoPass  (u)");
+        assert_eq!(cache.menu, "GitHub  (octocat)\nGitLab\nNoPass  (u)");
         assert_eq!(
-            tsv,
+            cache.tsv,
             vec![
                 ("GitHub  (octocat)".to_string(), "id-github".to_string()),
                 ("GitLab".to_string(), "id-gitlab".to_string()),
                 ("NoPass  (u)".to_string(), "id-nopass".to_string()),
             ]
         );
-        assert_eq!(pass.get("id-github").map(String::as_str), Some("gh-secret"));
-        assert_eq!(pass.get("id-gitlab").map(String::as_str), Some("gl-secret"));
+        assert_eq!(
+            cache.pass.get("id-github").map(String::as_str),
+            Some("gh-secret")
+        );
+        assert_eq!(
+            cache.pass.get("id-gitlab").map(String::as_str),
+            Some("gl-secret")
+        );
         // Empty passwords and non-login items stay out of the password table.
-        assert!(!pass.contains_key("id-nopass"));
-        assert!(!pass.contains_key("id-note"));
+        assert!(!cache.pass.contains_key("id-nopass"));
+        assert!(!cache.pass.contains_key("id-note"));
     }
 
     #[test]
-    fn parse_cache_tolerates_invalid_json() {
-        let (menu, tsv, pass) = parse_cache(b"not json");
-        assert!(menu.is_empty());
-        assert!(tsv.is_empty());
-        assert!(pass.is_empty());
+    fn parse_cache_accepts_an_empty_vault() {
+        let cache = parse_cache(b"[]").expect("an empty array is valid");
+        assert!(cache.menu.is_empty());
+        assert!(cache.tsv.is_empty());
+        assert!(cache.pass.is_empty());
+    }
+
+    #[test]
+    fn parse_cache_rejects_invalid_json() {
+        // `bw list items` with a stale session exits 0 with an empty stdout,
+        // so this must be a failed load rather than an empty vault.
+        assert!(parse_cache(b"").is_none());
+        assert!(parse_cache(b"\n").is_none());
+        assert!(parse_cache(b"not json").is_none());
+        // A JSON value that is not an item array is equally unusable.
+        assert!(parse_cache(b"{}").is_none());
     }
 }
