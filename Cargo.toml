@@ -17,7 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The view/UI layer. Pinned to the revision with `min_match_chars`
 # (hidden item list until the query is long enough).
-r-modals = { git = "https://github.com/Kevin-Ramirez127/r-modals", rev = "54cd66d81deb849c44ac42d8c15367d6f9a8b14d" }
+r-modals = { git = "https://github.com/Kevin-Ramirez127/r-modals", rev = "e335be2bf5a5a9735da9b515ecc6b9b36b5b5376" }
 
 # Ship a small, fast binary: `strip` + LTO + `panic = "abort"` cut the size
 # substantially, and every dialog is a short-lived child process, so a smaller
