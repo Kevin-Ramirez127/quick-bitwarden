@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::daemon::cleanup_stale;
 use crate::paths::Paths;
 use crate::proc::{self, command_exists, is_fifo, pid_alive, read_pid, send_signal};
-use crate::vault;
+use crate::{ui, vault};
 
 /// `daemon_alive`: pid file points at a live process.
 pub fn daemon_alive(paths: &Paths) -> bool {
@@ -135,6 +135,34 @@ pub fn cmd_hide(paths: &Paths) {
     kill_menu(paths);
 }
 
+/// `hide-items`: keep the picker's item list out of the default view until a
+/// 3+ character search. Persisted in `$QBW_BASE/hide_items`, so it survives
+/// `stop`/`restart`.
+pub fn cmd_hide_items(paths: &Paths) {
+    set_items_hidden(paths, true);
+}
+
+/// `show-items`: list every item again when the picker opens.
+pub fn cmd_show_items(paths: &Paths) {
+    set_items_hidden(paths, false);
+}
+
+fn set_items_hidden(paths: &Paths, hidden: bool) {
+    // The picker child reads the marker itself, so a running daemon picks the
+    // change up on the next `show` without a round-trip.
+    let _ = std::fs::create_dir_all(&paths.base);
+    if paths.set_items_hidden(hidden).is_err() {
+        crate::die("could not save the items setting");
+    }
+    let message = if hidden {
+        "Item list hidden: type 3+ characters to search"
+    } else {
+        "Item list shown again"
+    };
+    ui::notify(message);
+    println!("quick-bitwarden: {message}");
+}
+
 /// `sync`: ask the daemon to run `bw sync` and refresh its cache.
 pub fn cmd_sync(paths: &Paths) {
     ensure_daemon(paths);
@@ -232,8 +260,13 @@ pub fn cmd_status(paths: &Paths) {
         .map(|s| s.trim_end_matches(['\n', '\r']).to_string());
 
     let status = vault::bw_status_status_only(session.as_deref());
+    let items = if paths.items_hidden() {
+        "hidden until a 3+ character search"
+    } else {
+        "shown"
+    };
     let pid = read_pid(&paths.pid).unwrap_or(0);
-    println!("quick-bitwarden: daemon running (pid {pid}), vault: {status}");
+    println!("quick-bitwarden: daemon running (pid {pid}), vault: {status}, items: {items}");
 }
 
 /// `status --toggle`: report whether the picker is shown or hidden.

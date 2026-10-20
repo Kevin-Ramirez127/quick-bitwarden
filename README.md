@@ -68,6 +68,8 @@ quick-bitwarden hide     # hide it (the daemon keeps running)
 quick-bitwarden toggle   # explains itself
 quick-bitwarden sync     # run `bw sync` and refresh the daemon cache
 quick-bitwarden lock     # lock the vault and forget the cached session
+quick-bitwarden hide-items  # hide the item list until a 3+ character search
+quick-bitwarden show-items  # show the full item list again
 quick-bitwarden stop     # stop the daemon (keeps the session in /tmp/qbw/s)
 quick-bitwarden restart  # restart the daemon (starts it if not running)
 quick-bitwarden status   # daemon and vault status
@@ -92,6 +94,21 @@ Queries that start with `>` are commands, not item names (defined in
 
 - `>sync` / `>s` — run `bw sync` and refresh the daemon cache.
 - `>lock` / `>l` — lock the vault and forget the cached session.
+- `>hide items` — hide the item list until you search for 3+ characters.
+- `>show items` — show the full item list again.
+
+#### Hiding the item list
+
+`>hide items` (or `quick-bitwarden hide-items`) keeps the vault out of the
+default view: the picker starts empty and only reveals items when the search
+is meaningful.
+
+- 3 or more characters: normal case-insensitive matching.
+- Fewer than 3 characters: only an item whose name is typed **exactly** (or
+  its short id) is shown.
+- The choice is stored in `$QBW_BASE/hide_items`, so it survives
+  `stop`/`restart` (and the daemon does not need to be restarted to pick it
+  up). `>show items` removes it.
 
 On tiling compositors (sway/Hyprland), float the window via its app id:
 

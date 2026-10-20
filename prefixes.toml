@@ -25,3 +25,13 @@ hint = "Lock the vault"
 prefix = ">l"
 shell = "{qbw} lock"
 hint = "Lock the vault"
+
+[[prefix]]
+prefix = ">hide items"
+shell = "{qbw} hide-items"
+hint = "Hide the item list until a 3+ character search"
+
+[[prefix]]
+prefix = ">show items"
+shell = "{qbw} show-items"
+hint = "Show the full item list"

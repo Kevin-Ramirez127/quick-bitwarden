@@ -29,6 +29,8 @@ fn usage() {
          \x20 toggle         Open the picker if closed, close it if open (default)\n\
          \x20 sync           Sync the vault and refresh the cache\n\
          \x20 lock           Lock the vault and forget the cached session\n\
+         \x20 hide-items     Hide the item list until a 3+ character search\n\
+         \x20 show-items     Show the full item list again\n\
          \x20 stop           Stop the background daemon\n\
          \x20 restart        Restart the daemon (starts it if not running)\n\
          \x20 status         Show daemon and vault status\n\
@@ -70,6 +72,8 @@ fn main() {
         Some("toggle") | None => commands::cmd_toggle(&paths),
         Some("sync") => commands::cmd_sync(&paths),
         Some("lock") => commands::cmd_lock(&paths),
+        Some("hide-items") => commands::cmd_hide_items(&paths),
+        Some("show-items") => commands::cmd_show_items(&paths),
         Some("stop") => commands::cmd_stop(&paths),
         Some("restart") => commands::cmd_restart(&paths),
         Some("status") => {
@@ -80,7 +84,7 @@ fn main() {
             }
         }
         Some(_) => die(
-            "usage: quick-bitwarden [show|hide|toggle|sync|lock|stop|restart|status] (see --help)",
+            "usage: quick-bitwarden [show|hide|toggle|sync|lock|hide-items|show-items|stop|restart|status] (see --help)",
         ),
     }
 }
