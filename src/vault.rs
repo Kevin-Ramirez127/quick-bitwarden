@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use serde::Deserialize;
 
@@ -23,6 +24,10 @@ pub struct State {
     pub last_refresh: i64,
     /// Current `BW_SESSION` token, if any.
     pub session: Option<String>,
+    /// Cached vault lock state: `Some(true)` unlocked, `Some(false)` locked or
+    /// unauthenticated, `None` unknown. Lets us skip a `bw status` round-trip
+    /// whenever we already know the answer.
+    pub unlocked: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -90,35 +95,129 @@ pub fn load_session(state: &mut State, paths: &Paths) {
     }
 }
 
-/// `ensure_unlocked`: load the session, then unlock/log in as needed.
-pub fn ensure_unlocked(state: &mut State, paths: &Paths) -> bool {
+/// Outcome of a cache load that never prompts.
+pub enum Load {
+    /// The vault is unlocked and the in-memory cache is populated.
+    Loaded,
+    /// The vault is locked; the caller must run [`prompt_and_unlock`].
+    NeedsPassword,
+    /// Not logged in (`bw login` is required).
+    Unauthenticated,
+    /// `bw` failed for another reason.
+    Failed,
+}
+
+/// `needs_prompt`: true when we already know a password dialog is required.
+///
+/// Deliberately conservative: a stored session that turns out to be stale is
+/// handled by [`try_load`] returning [`Load::NeedsPassword`], not by probing
+/// here (a `bw status` would add ~1.5 s to the common cold show).
+pub fn needs_prompt(state: &mut State, paths: &Paths) -> bool {
+    load_session(state, paths);
+    state.session.is_none() || state.unlocked == Some(false)
+}
+
+/// `try_load`: populate the cache without ever prompting.
+///
+/// The unlock check is folded into the cache load: when a session token is
+/// stored, `bw list items` doubles as the probe, so an already-unlocked vault
+/// costs a single `bw` call instead of `bw status` **plus** `bw list items`.
+pub fn try_load(state: &mut State, paths: &Paths) -> Load {
     load_session(state, paths);
 
+    // Already warm with data (e.g. `sync`): no need to re-list first.
+    if state.unlocked == Some(true) && !state.menu.is_empty() {
+        return Load::Loaded;
+    }
+
+    // A stored session lets `bw list items` double as the unlock probe. Skip it
+    // when we already know the vault is locked, to avoid a doomed `bw` call.
+    if state.unlocked != Some(false) && state.session.is_some() && refresh_cache(state, paths) {
+        state.unlocked = Some(true);
+        return Load::Loaded;
+    }
+
     match bw_status(state.session.as_deref()).as_str() {
-        "unlocked" => true,
-        "locked" => {
-            let password = match ui::ask_password(paths, "Master password") {
-                Some(p) if !p.is_empty() => p,
-                _ => return false,
-            };
-            match bw_unlock(&password) {
-                Some(token) => {
-                    let _ = std::fs::write(&paths.session, token.as_bytes());
-                    state.session = Some(token);
-                    true
-                }
-                None => {
-                    ui::error_dialog(paths, "Could not unlock the vault: wrong master password?");
-                    false
-                }
+        "unlocked" => {
+            state.unlocked = Some(true);
+            if refresh_cache(state, paths) {
+                Load::Loaded
+            } else {
+                Load::Failed
             }
         }
+        "locked" => {
+            state.unlocked = Some(false);
+            Load::NeedsPassword
+        }
         "unauthenticated" => {
+            state.unlocked = Some(false);
+            Load::Unauthenticated
+        }
+        _ => Load::Failed,
+    }
+}
+
+/// `prompt_and_unlock`: ask for the master password and store the session.
+///
+/// Does **not** load the cache: the caller owns the loading window, so it can
+/// open it before the (slow) `bw list items` that follows.
+pub fn prompt_and_unlock(state: &mut State, paths: &Paths) -> bool {
+    load_session(state, paths);
+
+    // Re-probe: the vault may have been unlocked since `needs_prompt`.
+    match bw_status(state.session.as_deref()).as_str() {
+        "unauthenticated" => {
+            ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
+            state.unlocked = Some(false);
+            return false;
+        }
+        "unlocked" => {
+            state.unlocked = Some(true);
+            return true;
+        }
+        _ => {}
+    }
+
+    let password = match ui::ask_password(paths, "Master password") {
+        Some(p) if !p.is_empty() => p,
+        // Cancelled: remember the vault is locked so the background refresh
+        // does not spend a `bw` call probing it again.
+        _ => {
+            state.unlocked = Some(false);
+            return false;
+        }
+    };
+    match bw_unlock(&password) {
+        Some(token) => {
+            let _ = std::fs::write(&paths.session, token.as_bytes());
+            state.session = Some(token);
+            state.unlocked = Some(true);
+            true
+        }
+        None => {
+            ui::error_dialog(paths, "Could not unlock the vault: wrong master password?");
+            false
+        }
+    }
+}
+
+/// `ensure_unlocked`: unlock (prompting if needed) and populate the cache.
+/// Returns `true` when the vault is unlocked (even if it holds no login items).
+///
+/// Used by commands that need a ready cache in one step (e.g. `sync`); the
+/// picker uses [`needs_prompt`] + [`try_load`] so it can show its loading window
+/// around the slow part.
+pub fn ensure_unlocked(state: &mut State, paths: &Paths) -> bool {
+    match try_load(state, paths) {
+        Load::Loaded => true,
+        Load::NeedsPassword => prompt_and_unlock(state, paths) && refresh_cache(state, paths),
+        Load::Unauthenticated => {
             ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
             false
         }
-        other => {
-            ui::error_dialog(paths, &format!("Unexpected bw status: {other}"));
+        Load::Failed => {
+            ui::error_dialog(paths, "Could not read the vault");
             false
         }
     }
@@ -151,25 +250,117 @@ pub fn bw_sync(session: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// `refresh_cache`: rebuild the menu/tsv/password tables from `bw list items`.
+/// `bw lock`: lock the vault so the next `show` needs the master password.
+pub fn bw_lock(session: Option<&str>) -> bool {
+    let mut cmd = Command::new("bw");
+    cmd.arg("lock");
+    if let Some(s) = session {
+        cmd.env("BW_SESSION", s);
+    }
+    cmd.output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// The parse result of one `bw list items`, before it is folded into [`State`].
+struct Cache {
+    menu: String,
+    tsv: Vec<(String, String)>,
+    pass: HashMap<String, String>,
+}
+
+impl Cache {
+    fn apply(self, state: &mut State) {
+        state.menu = self.menu;
+        state.tsv = self.tsv;
+        state.pass = self.pass;
+    }
+}
+
+/// `bw list items` → cache tables. `None` when `bw` itself fails.
+fn fetch_cache(session: Option<&str>) -> Option<Cache> {
+    let mut cmd = Command::new("bw");
+    cmd.args(["list", "items"]);
+    if let Some(s) = session {
+        cmd.env("BW_SESSION", s);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let (menu, tsv, pass) = parse_cache(&out.stdout);
+    Some(Cache { menu, tsv, pass })
+}
+
+/// `refresh_cache`: rebuild the menu/tsv/password tables from `bw list items`,
+/// stamping `last_refresh` on success so callers cannot forget to.
 /// Returns `false` only when `bw` itself fails.
 pub fn refresh_cache(state: &mut State, paths: &Paths) -> bool {
     let _ = paths;
-    let mut cmd = Command::new("bw");
-    cmd.args(["list", "items"]);
-    if let Some(s) = state.session.as_deref() {
-        cmd.env("BW_SESSION", s);
+    match fetch_cache(state.session.as_deref()) {
+        Some(cache) => {
+            cache.apply(state);
+            state.last_refresh = now_secs();
+            true
+        }
+        None => false,
     }
-    let out = match cmd.output() {
-        Ok(out) if out.status.success() => out,
-        _ => return false,
-    };
+}
 
-    let (menu, tsv, pass) = parse_cache(&out.stdout);
-    state.menu = menu;
-    state.tsv = tsv;
-    state.pass = pass;
-    true
+/// A `bw list items` running on a worker thread.
+///
+/// Refreshing on the daemon's FIFO loop would block the next `show` for the
+/// whole (multi-second) `bw` round-trip. The worker instead posts its result
+/// back, and the loop folds it in when it is ready — a `show` that arrives
+/// meanwhile is served from the warm in-memory cache instead of waiting.
+pub struct BackgroundRefresh {
+    rx: Receiver<(Option<Cache>, i64)>,
+}
+
+impl BackgroundRefresh {
+    /// Spawn the worker; it completes even if the receiver is dropped.
+    pub fn start(session: Option<String>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let cache = fetch_cache(session.as_deref());
+            let _ = tx.send((cache, now_secs()));
+        });
+        Self { rx }
+    }
+
+    /// Fold the worker's result in if it has arrived. `true` when it is done.
+    pub fn try_apply(&self, state: &mut State) -> bool {
+        match self.rx.try_recv() {
+            Ok((Some(cache), at)) => {
+                cache.apply(state);
+                state.last_refresh = at;
+                state.unlocked = Some(true);
+                true
+            }
+            Ok((None, _)) => {
+                state.unlocked = Some(false);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => true,
+        }
+    }
+}
+
+/// `start_refresh`: kick off a background refresh when one is due.
+///
+/// Returns `None` while the cache is still fresh or while the vault is known to
+/// be locked. Callers that already hold a [`BackgroundRefresh`] should not call
+/// this — they keep their in-flight one instead.
+pub fn start_refresh(state: &State, paths: &Paths) -> Option<BackgroundRefresh> {
+    let now = now_secs();
+    if now - state.last_refresh < paths.refresh_interval {
+        return None;
+    }
+    if state.unlocked == Some(false) {
+        return None;
+    }
+    Some(BackgroundRefresh::start(state.session.clone()))
 }
 
 /// Pure `bw list items` → `(menu, tsv, id->password)` transform, matching the
@@ -214,24 +405,6 @@ pub fn parse_cache(json: &[u8]) -> (String, Vec<(String, String)>, HashMap<Strin
     }
 
     (labels.join("\n"), tsv, pass)
-}
-
-/// `refresh_if_stale`: refresh at most once per `QBW_REFRESH_INTERVAL`.
-///
-/// A background refresh never prompts: the master-password dialog belongs to
-/// `show`. If the session is locked we simply skip — otherwise a `show` that
-/// the user cancelled would immediately re-open the prompt right here.
-pub fn refresh_if_stale(state: &mut State, paths: &Paths) {
-    let now = now_secs();
-    if now - state.last_refresh < paths.refresh_interval {
-        return;
-    }
-    if bw_status(state.session.as_deref()) != "unlocked" {
-        return;
-    }
-    if refresh_cache(state, paths) {
-        state.last_refresh = now;
-    }
 }
 
 /// `bw get password <id-or-name>` fallback.

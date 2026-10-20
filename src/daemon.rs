@@ -28,8 +28,24 @@ pub fn run_daemon(paths: &Paths) {
     }
 
     let _ = std::fs::create_dir_all(&paths.base);
+
+    // Single instance: only the process that owns this lock may be the daemon.
+    // A losing `--daemon` exits quietly; `flock` is released by the kernel when
+    // the owner exits, so a crash cannot leave a stale lock behind.
+    let Some(_instance) = proc::try_lock(&paths.instance_lock()) else {
+        return;
+    };
+
     cleanup_stale(paths);
     ui::write_default_prefixes(paths);
+
+    // Menu state: `"<generation> <busy>"`. The daemon bumps the generation and
+    // sets `busy` in one atomic write *before* doing any work, so a concurrent
+    // press can neither reuse an old generation nor slip in while the picker is
+    // still being prepared (which can take a `bw` round-trip).
+    let mut generation: u64 = 0;
+    let mut busy = false;
+    proc::write_menu_state(&paths.menu_state(), generation, busy);
 
     let _ = std::fs::write(&paths.pid, format!("{}\n", std::process::id()));
 
@@ -57,29 +73,79 @@ pub fn run_daemon(paths: &Paths) {
     let mut reader = BufReader::new(ctl_file);
 
     let mut state = State::default();
-    // Never prompt at startup. The master-password dialog belongs to `show`;
-    // prompting here would make a cancelled prompt immediately reappear for the
-    // `show` that `ensure_daemon` queued right after starting the daemon.
-    // Warm the cache only when the session is already unlocked.
-    vault::load_session(&mut state, paths);
-    if vault::bw_status(state.session.as_deref()) == "unlocked" {
-        let _ = vault::refresh_cache(&mut state, paths);
-    }
-    state.last_refresh = proc::now_secs();
+    // No vault I/O at startup. The first `show` unlocks and loads the cache on
+    // demand, so starting the daemon (including `restart`) never blocks on `bw`
+    // and the control FIFO is serviced immediately.
+    //
+    // Periodic refreshes run on a worker thread, never on this loop, so a slow
+    // `bw list items` cannot delay the next `show`.
+    let mut refresh: Option<vault::BackgroundRefresh> = None;
 
     loop {
-        let mut cmd = String::new();
-        match reader.read_line(&mut cmd) {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
-            Ok(_) => match cmd.trim_end_matches(['\n', '\r']) {
-                "show" => {
-                    do_show(&mut state, paths);
-                    vault::refresh_if_stale(&mut state, paths);
+            Ok(_) => {
+                // Fold in a refresh that finished while we were idle or busy
+                // with the previous command, before acting on the new one.
+                let refresh_done = match &refresh {
+                    Some(r) => r.try_apply(&mut state),
+                    None => false,
+                };
+                if refresh_done {
+                    refresh = None;
                 }
-                "sync" => do_sync(&mut state, paths),
-                "stop" => break,
-                _ => {}
-            },
+                let line = line.trim_end_matches(['\n', '\r']);
+                let (verb, arg) = match line.split_once(' ') {
+                    Some((verb, arg)) => (verb, Some(arg.trim())),
+                    None => (line, None),
+                };
+                match verb {
+                    "show" => {
+                        if busy {
+                            continue;
+                        }
+                        if let Some(stamp) = arg.and_then(|a| a.parse::<u64>().ok()) {
+                            // Stamped before the current menu generation: this
+                            // request was queued while a window was already
+                            // being opened, so the user has been served. Drop
+                            // it instead of stacking a second window.
+                            if stamp != generation {
+                                continue;
+                            }
+                        }
+                        // Claim this generation *before* the (possibly slow)
+                        // unlock/cache load and window spawn, so concurrent
+                        // presses see `busy` and do not queue a second window.
+                        generation = generation.wrapping_add(1);
+                        busy = true;
+                        proc::write_menu_state(&paths.menu_state(), generation, busy);
+                        do_show(&mut state, paths);
+                        busy = false;
+                        proc::write_menu_state(&paths.menu_state(), generation, busy);
+                        // Refresh behind the scenes: the picker has closed, so
+                        // the user is no longer waiting, and the next `show`
+                        // will fold in the result if it is ready.
+                        if refresh.is_none() {
+                            refresh = vault::start_refresh(&state, paths);
+                        }
+                    }
+                    "sync" => {
+                        // `do_sync` installs fresh data itself; drop any pending
+                        // background refresh so it cannot resurrect older data.
+                        refresh = None;
+                        do_sync(&mut state, paths);
+                    }
+                    "lock" => {
+                        // A pending refresh still holds the old session; drop
+                        // it so it cannot repopulate the cache after the lock.
+                        refresh = None;
+                        do_lock(&mut state, paths);
+                    }
+                    "stop" => break,
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -90,18 +156,62 @@ pub fn run_daemon(paths: &Paths) {
 /// the clipboard clear.
 fn do_show(state: &mut State, paths: &Paths) {
     if state.menu.is_empty() {
-        if !vault::ensure_unlocked(state, paths) {
+        // Prompt first when we already know the vault needs it, so the
+        // loading window never covers the master-password dialog.
+        if vault::needs_prompt(state, paths) && !vault::prompt_and_unlock(state, paths) {
             return;
         }
-        let _ = vault::refresh_cache(state, paths);
-    }
 
-    if state.menu.is_empty() {
-        ui::error_dialog(paths, "No login items in the vault");
-        return;
-    }
+        // Open the picker now: it shows its loading message until the (slow)
+        // `bw list items` has populated the menu.
+        let Some(mut session) = ui::start_menu(paths) else {
+            return;
+        };
 
-    if !ui::launch_menu(paths, &state.menu) {
+        let mut load = vault::try_load(state, paths);
+        if matches!(load, vault::Load::NeedsPassword) {
+            // The stored session was stale. Swap the loading window for the
+            // password prompt, then reopen it for the actual load.
+            session.cancel(paths);
+            if !vault::prompt_and_unlock(state, paths) {
+                return;
+            }
+            let Some(reopened) = ui::start_menu(paths) else {
+                return;
+            };
+            session = reopened;
+            load = vault::try_load(state, paths);
+        }
+
+        match load {
+            vault::Load::Loaded => {}
+            vault::Load::NeedsPassword => {
+                session.cancel(paths);
+                return;
+            }
+            vault::Load::Unauthenticated => {
+                session.cancel(paths);
+                ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
+                return;
+            }
+            vault::Load::Failed => {
+                session.cancel(paths);
+                ui::error_dialog(paths, "Could not read the vault");
+                return;
+            }
+        }
+
+        if state.menu.is_empty() {
+            session.cancel(paths);
+            ui::error_dialog(paths, "No login items in the vault");
+            return;
+        }
+
+        session.send_items(&state.menu);
+        if !session.wait(paths) {
+            return;
+        }
+    } else if !ui::launch_menu(paths, &state.menu) {
         return;
     }
 
@@ -164,10 +274,25 @@ fn do_sync(state: &mut State, paths: &Paths) {
         ui::error_dialog(paths, "Could not sync the vault");
         return;
     }
-    if vault::refresh_cache(state, paths) {
-        state.last_refresh = proc::now_secs();
-    }
+    let _ = vault::refresh_cache(state, paths);
     ui::notify("Vault synced");
+}
+
+/// `lock`: lock the vault and forget the session token and cached items, so a
+/// later `show` must ask for the master password again.
+fn do_lock(state: &mut State, paths: &Paths) {
+    if !vault::bw_lock(state.session.as_deref()) {
+        ui::error_dialog(paths, "Could not lock the vault");
+        return;
+    }
+    let _ = std::fs::remove_file(&paths.session);
+    state.session = None;
+    state.menu.clear();
+    state.tsv.clear();
+    state.pass.clear();
+    state.last_refresh = 0;
+    state.unlocked = Some(false);
+    ui::notify("Vault locked");
 }
 
 /// `cleanup_stale`: drop any leftover picker and runtime files.

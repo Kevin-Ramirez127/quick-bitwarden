@@ -1,6 +1,6 @@
 [package]
 name = "quick-bitwarden"
-version = "1.0.0"
+version = "0.2.0"
 edition = "2021"
 description = "A quick way to copy your Bitwarden passwords, backed by a daemon and an r-modals picker"
 license = "GPL-3.0-or-later"
@@ -16,4 +16,15 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The view/UI layer. Pinned to the revision this migration targets.
-r-modals = { git = "https://github.com/Kevin-Ramirez127/r-modals", rev = "c70faeb5aa14318bfec6c98a657c939588dde12d" }
+r-modals = { git = "https://github.com/Kevin-Ramirez127/r-modals", rev = "130f713c547bf6421decf6f333a9c012d2514d39" }
+
+# Ship a small, fast binary: `strip` + LTO + `panic = "abort"` cut the size
+# substantially, and every dialog is a short-lived child process, so a smaller
+# image means less work to map on each spawn.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+

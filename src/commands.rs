@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::daemon::cleanup_stale;
 use crate::paths::Paths;
-use crate::proc::{command_exists, is_fifo, pid_alive, read_pid, send_signal};
+use crate::proc::{self, command_exists, is_fifo, pid_alive, read_pid, send_signal};
 use crate::vault;
 
 /// `daemon_alive`: pid file points at a live process.
@@ -45,11 +45,18 @@ fn send_cmd(paths: &Paths, cmd: &str) {
 
 /// `ensure_daemon`: start the detached daemon and wait for it to be ready.
 pub fn ensure_daemon(paths: &Paths) {
+    let _ = std::fs::create_dir_all(&paths.base);
+
+    // Serialise startup across concurrent invocations. Without this, two
+    // launchers can both see no daemon and spawn one each (two daemons, two
+    // windows). The guard is held until readiness, so the next launcher sees
+    // the daemon already running.
+    let _start_guard = proc::lock(&paths.start_lock());
+
     if daemon_alive(paths) {
         return;
     }
 
-    let _ = std::fs::create_dir_all(&paths.base);
     let _ = std::fs::set_permissions(&paths.base, std::fs::Permissions::from_mode(0o700));
     cleanup_stale(paths);
 
@@ -71,16 +78,40 @@ pub fn ensure_daemon(paths: &Paths) {
         .stderr(Stdio::null());
     let _ = cmd.spawn();
 
-    for _ in 0..200 {
+    // Poll at 10 ms so a cold start does not wait up to a full 100 ms tick
+    // after the daemon has created its pid file and control FIFO.
+    for _ in 0..2000 {
         if daemon_alive(paths) && is_fifo(&paths.ctl) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(10));
     }
     crate::die(&format!(
         "daemon failed to start (see {}/error.log)",
         paths.base.display()
     ));
+}
+
+/// `request_show`: ask the daemon for a picker window exactly once per press.
+///
+/// The daemon publishes `"<generation> <busy>"` atomically. Reading it before
+/// checking `menu.pid` means a request issued while the picker is being
+/// prepared (`busy`) or for an older generation is never sent; one that races
+/// a concurrent press is dropped by the daemon's generation check.
+fn request_show(paths: &Paths) {
+    let state_file = paths.menu_state();
+    let has_state = state_file.is_file();
+    let (generation, busy) = proc::read_menu_state(&state_file);
+    if busy || menu_open(paths) {
+        return;
+    }
+    if has_state {
+        send_cmd(paths, &format!("show {generation}"));
+    } else {
+        // Daemon from before generation stamping: its protocol only knows the
+        // bare command. It will be upgraded on the next `restart`.
+        send_cmd(paths, "show");
+    }
 }
 
 /// `toggle`: close the picker if open, otherwise open it.
@@ -90,16 +121,13 @@ pub fn cmd_toggle(paths: &Paths) {
         return;
     }
     ensure_daemon(paths);
-    send_cmd(paths, "show");
+    request_show(paths);
 }
 
 /// `show`: open the picker unless it is already open.
 pub fn cmd_show(paths: &Paths) {
     ensure_daemon(paths);
-    if menu_open(paths) {
-        return;
-    }
-    send_cmd(paths, "show");
+    request_show(paths);
 }
 
 /// `hide`: close the picker, keeping the daemon alive.
@@ -111,6 +139,32 @@ pub fn cmd_hide(paths: &Paths) {
 pub fn cmd_sync(paths: &Paths) {
     ensure_daemon(paths);
     send_cmd(paths, "sync");
+}
+
+/// `lock`: lock the vault and forget the cached session and item data.
+///
+/// The daemon owns both the session token and the cache, so it does the work
+/// when it is running; otherwise this process can lock `bw` directly.
+pub fn cmd_lock(paths: &Paths) {
+    if daemon_alive(paths) {
+        // Close the picker first: the daemon may be blocked serving it, and
+        // a stale window must not keep offering items after the lock.
+        kill_menu(paths);
+        send_cmd(paths, "lock");
+        return;
+    }
+
+    if !command_exists("bw") {
+        crate::die("missing dependency: bw");
+    }
+    let session = std::fs::read_to_string(&paths.session)
+        .ok()
+        .map(|s| s.trim_end_matches(['\n', '\r']).to_string());
+    if !vault::bw_lock(session.as_deref()) {
+        crate::die("could not lock the vault");
+    }
+    let _ = std::fs::remove_file(&paths.session);
+    println!("quick-bitwarden: vault locked");
 }
 
 /// `stop`: ask the daemon to exit, forcing it after a grace period.
@@ -187,9 +241,10 @@ pub fn cmd_status_toggle(paths: &Paths) {
     println!("quick-bitwarden: {}", toggle_state(paths));
 }
 
-/// `"shown"` while a picker/prompt child is alive, `"hidden"` otherwise.
+/// `"shown"` while a picker is pending or open, `"hidden"` otherwise.
 pub fn toggle_state(paths: &Paths) -> &'static str {
-    if menu_open(paths) {
+    let (_, busy) = proc::read_menu_state(&paths.menu_state());
+    if busy || menu_open(paths) {
         "shown"
     } else {
         "hidden"
