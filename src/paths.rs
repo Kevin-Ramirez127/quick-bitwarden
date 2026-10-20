@@ -3,8 +3,9 @@
 
 use std::path::PathBuf;
 
-/// `quick-bitwarden --version`.
-pub const VERSION: &str = "1.0.0";
+/// `quick-bitwarden --version`. Sourced from `Cargo.toml`, so the manifest is
+/// the single place to bump the version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Everything the daemon and the thin client need to agree on.
 #[derive(Debug, Clone)]

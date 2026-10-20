@@ -155,7 +155,7 @@ The next `show` asks for the master password again. The daemon keeps running.
 - [x] Remove from user's clipboard in 20 seconds by default
 - [x] Sync the vault from the picker (`>sync` / `>s`) or with `quick-bitwarden sync`
 - [x] Lock the vault from the picker (`>lock` / `>l`) or with `quick-bitwarden lock`
-- [ ] Install script
+- [x] Install script
 
 **Flags**
 - [ ] Preserve the clipboard
