@@ -23,6 +23,10 @@ pub struct State {
     pub last_refresh: i64,
     /// Current `BW_SESSION` token, if any.
     pub session: Option<String>,
+    /// Cached vault lock state: `Some(true)` unlocked, `Some(false)` locked or
+    /// unauthenticated, `None` unknown. Lets us skip a `bw status` round-trip
+    /// whenever we already know the answer.
+    pub unlocked: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -90,21 +94,54 @@ pub fn load_session(state: &mut State, paths: &Paths) {
     }
 }
 
-/// `ensure_unlocked`: load the session, then unlock/log in as needed.
+/// `ensure_unlocked`: make sure the vault is unlocked and the in-memory cache
+/// is populated. Returns `true` when the vault is unlocked (even if it holds no
+/// login items), `false` when it could not be reached.
+///
+/// The unlock check is folded into the cache load: when a session token is
+/// stored, `bw list items` doubles as the probe, so an already-unlocked vault
+/// costs a single `bw` call instead of `bw status` **plus** `bw list items`.
+/// That removes the biggest fixed cost from every `show`.
 pub fn ensure_unlocked(state: &mut State, paths: &Paths) -> bool {
     load_session(state, paths);
 
+    // Known unlocked: only the cache can be stale.
+    if state.unlocked == Some(true) {
+        if state.menu.is_empty() {
+            return refresh_cache(state, paths);
+        }
+        return true;
+    }
+
+    // Unknown state with a stored session: `bw list items` doubles as the
+    // unlock probe, so an unlocked vault needs no separate `bw status`.
+    if state.unlocked.is_none() && state.session.is_some() && refresh_cache(state, paths) {
+        state.unlocked = Some(true);
+        return true;
+    }
+
     match bw_status(state.session.as_deref()).as_str() {
-        "unlocked" => true,
+        "unlocked" => {
+            state.unlocked = Some(true);
+            let _ = refresh_cache(state, paths);
+            true
+        }
         "locked" => {
             let password = match ui::ask_password(paths, "Master password") {
                 Some(p) if !p.is_empty() => p,
-                _ => return false,
+                // Cancelled: remember the vault is locked so the background
+                // refresh does not spend a `bw` call probing it again.
+                _ => {
+                    state.unlocked = Some(false);
+                    return false;
+                }
             };
             match bw_unlock(&password) {
                 Some(token) => {
                     let _ = std::fs::write(&paths.session, token.as_bytes());
                     state.session = Some(token);
+                    state.unlocked = Some(true);
+                    let _ = refresh_cache(state, paths);
                     true
                 }
                 None => {
@@ -115,6 +152,7 @@ pub fn ensure_unlocked(state: &mut State, paths: &Paths) -> bool {
         }
         "unauthenticated" => {
             ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
+            state.unlocked = Some(false);
             false
         }
         other => {
@@ -151,7 +189,8 @@ pub fn bw_sync(session: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// `refresh_cache`: rebuild the menu/tsv/password tables from `bw list items`.
+/// `refresh_cache`: rebuild the menu/tsv/password tables from `bw list items`,
+/// stamping `last_refresh` on success so callers cannot forget to.
 /// Returns `false` only when `bw` itself fails.
 pub fn refresh_cache(state: &mut State, paths: &Paths) -> bool {
     let _ = paths;
@@ -169,6 +208,7 @@ pub fn refresh_cache(state: &mut State, paths: &Paths) -> bool {
     state.menu = menu;
     state.tsv = tsv;
     state.pass = pass;
+    state.last_refresh = now_secs();
     true
 }
 
@@ -218,19 +258,22 @@ pub fn parse_cache(json: &[u8]) -> (String, Vec<(String, String)>, HashMap<Strin
 
 /// `refresh_if_stale`: refresh at most once per `QBW_REFRESH_INTERVAL`.
 ///
-/// A background refresh never prompts: the master-password dialog belongs to
-/// `show`. If the session is locked we simply skip — otherwise a `show` that
-/// the user cancelled would immediately re-open the prompt right here.
+/// A background refresh never prompts. Rather than asking `bw status` first and
+/// then reloading the cache, it probes with the cache load itself and records
+/// the outcome, so an unlocked vault costs one `bw` call and a known-locked
+/// vault costs none at all.
 pub fn refresh_if_stale(state: &mut State, paths: &Paths) {
     let now = now_secs();
     if now - state.last_refresh < paths.refresh_interval {
         return;
     }
-    if bw_status(state.session.as_deref()) != "unlocked" {
+    if state.unlocked == Some(false) {
         return;
     }
     if refresh_cache(state, paths) {
-        state.last_refresh = now;
+        state.unlocked = Some(true);
+    } else {
+        state.unlocked = Some(false);
     }
 }
 

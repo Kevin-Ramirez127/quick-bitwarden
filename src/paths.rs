@@ -54,9 +54,35 @@ impl Paths {
         self.base.join("prefixes.toml")
     }
 
-    /// Remove the runtime files (`ctl`, `pid`, `menu.pid`, `sel`).
+    /// `$BASE/lock` — held by the one running daemon (`flock`) for its life.
+    pub fn instance_lock(&self) -> PathBuf {
+        self.base.join("lock")
+    }
+
+    /// `$BASE/start.lock` — serialises concurrent launcher startup.
+    pub fn start_lock(&self) -> PathBuf {
+        self.base.join("start.lock")
+    }
+
+    /// `$BASE/gen` — `"<generation> <busy>"`; `busy` is 1 while a picker is
+    /// pending or open. Written atomically by the daemon.
+    pub fn menu_state(&self) -> PathBuf {
+        self.base.join("gen")
+    }
+
+    /// Remove the runtime files (`ctl`, `pid`, `menu.pid`, `sel`, `gen`).
+    /// The lock files are intentionally kept: `flock` is tied to the inode.
     pub fn remove_runtime_files(&self) {
-        for p in [&self.ctl, &self.pid, &self.menu_pid, &self.sel] {
+        let menu_state = self.menu_state();
+        let menu_state_tmp = menu_state.with_extension("tmp");
+        for p in [
+            &self.ctl,
+            &self.pid,
+            &self.menu_pid,
+            &self.sel,
+            &menu_state,
+            &menu_state_tmp,
+        ] {
             let _ = std::fs::remove_file(p);
         }
     }

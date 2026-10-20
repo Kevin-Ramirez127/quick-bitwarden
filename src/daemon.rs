@@ -28,8 +28,24 @@ pub fn run_daemon(paths: &Paths) {
     }
 
     let _ = std::fs::create_dir_all(&paths.base);
+
+    // Single instance: only the process that owns this lock may be the daemon.
+    // A losing `--daemon` exits quietly; `flock` is released by the kernel when
+    // the owner exits, so a crash cannot leave a stale lock behind.
+    let Some(_instance) = proc::try_lock(&paths.instance_lock()) else {
+        return;
+    };
+
     cleanup_stale(paths);
     ui::write_default_prefixes(paths);
+
+    // Menu state: `"<generation> <busy>"`. The daemon bumps the generation and
+    // sets `busy` in one atomic write *before* doing any work, so a concurrent
+    // press can neither reuse an old generation nor slip in while the picker is
+    // still being prepared (which can take a `bw` round-trip).
+    let mut generation: u64 = 0;
+    let mut busy = false;
+    proc::write_menu_state(&paths.menu_state(), generation, busy);
 
     let _ = std::fs::write(&paths.pid, format!("{}\n", std::process::id()));
 
@@ -57,29 +73,50 @@ pub fn run_daemon(paths: &Paths) {
     let mut reader = BufReader::new(ctl_file);
 
     let mut state = State::default();
-    // Never prompt at startup. The master-password dialog belongs to `show`;
-    // prompting here would make a cancelled prompt immediately reappear for the
-    // `show` that `ensure_daemon` queued right after starting the daemon.
-    // Warm the cache only when the session is already unlocked.
-    vault::load_session(&mut state, paths);
-    if vault::bw_status(state.session.as_deref()) == "unlocked" {
-        let _ = vault::refresh_cache(&mut state, paths);
-    }
-    state.last_refresh = proc::now_secs();
+    // No vault I/O at startup. The first `show` unlocks and loads the cache on
+    // demand, so starting the daemon (including `restart`) never blocks on `bw`
+    // and the control FIFO is serviced immediately.
 
     loop {
-        let mut cmd = String::new();
-        match reader.read_line(&mut cmd) {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
-            Ok(_) => match cmd.trim_end_matches(['\n', '\r']) {
-                "show" => {
-                    do_show(&mut state, paths);
-                    vault::refresh_if_stale(&mut state, paths);
+            Ok(_) => {
+                let line = line.trim_end_matches(['\n', '\r']);
+                let (verb, arg) = match line.split_once(' ') {
+                    Some((verb, arg)) => (verb, Some(arg.trim())),
+                    None => (line, None),
+                };
+                match verb {
+                    "show" => {
+                        if busy {
+                            continue;
+                        }
+                        if let Some(stamp) = arg.and_then(|a| a.parse::<u64>().ok()) {
+                            // Stamped before the current menu generation: this
+                            // request was queued while a window was already
+                            // being opened, so the user has been served. Drop
+                            // it instead of stacking a second window.
+                            if stamp != generation {
+                                continue;
+                            }
+                        }
+                        // Claim this generation *before* the (possibly slow)
+                        // unlock/cache load and window spawn, so concurrent
+                        // presses see `busy` and do not queue a second window.
+                        generation = generation.wrapping_add(1);
+                        busy = true;
+                        proc::write_menu_state(&paths.menu_state(), generation, busy);
+                        do_show(&mut state, paths);
+                        busy = false;
+                        proc::write_menu_state(&paths.menu_state(), generation, busy);
+                        vault::refresh_if_stale(&mut state, paths);
+                    }
+                    "sync" => do_sync(&mut state, paths),
+                    "stop" => break,
+                    _ => {}
                 }
-                "sync" => do_sync(&mut state, paths),
-                "stop" => break,
-                _ => {}
-            },
+            }
         }
     }
 
@@ -90,10 +127,10 @@ pub fn run_daemon(paths: &Paths) {
 /// the clipboard clear.
 fn do_show(state: &mut State, paths: &Paths) {
     if state.menu.is_empty() {
+        // `ensure_unlocked` populates the cache as part of the unlock check.
         if !vault::ensure_unlocked(state, paths) {
             return;
         }
-        let _ = vault::refresh_cache(state, paths);
     }
 
     if state.menu.is_empty() {
@@ -164,9 +201,7 @@ fn do_sync(state: &mut State, paths: &Paths) {
         ui::error_dialog(paths, "Could not sync the vault");
         return;
     }
-    if vault::refresh_cache(state, paths) {
-        state.last_refresh = proc::now_secs();
-    }
+    let _ = vault::refresh_cache(state, paths);
     ui::notify("Vault synced");
 }
 

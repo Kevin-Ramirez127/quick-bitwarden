@@ -28,6 +28,10 @@ for `QBW_CLEAR_AFTER` seconds and then is cleared.
 The daemon itself never opens a window: each dialog runs in a short-lived child
 process, so `hide`/`toggle` can close it from the outside.
 
+Only one daemon and one picker window run at a time. Concurrent launches are
+serialised with a lock, and a `show` request that races an already-opening
+picker is dropped instead of stacking a second window.
+
 ## Requirements
 
 - **bitwarden-cli** (`bw`). See how to install bitwarden-cli on the
