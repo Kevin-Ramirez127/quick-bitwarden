@@ -68,6 +68,8 @@ quick-bitwarden hide     # hide it (the daemon keeps running)
 quick-bitwarden toggle   # explains itself
 quick-bitwarden sync     # run `bw sync` and refresh the daemon cache
 quick-bitwarden lock     # lock the vault and forget the cached session
+quick-bitwarden hide-items  # hide the item list until a 3+ character search
+quick-bitwarden show-items  # show the full item list again
 quick-bitwarden stop     # stop the daemon (keeps the session in /tmp/qbw/s)
 quick-bitwarden restart  # restart the daemon (starts it if not running)
 quick-bitwarden status   # daemon and vault status
@@ -90,8 +92,23 @@ quick-bitwarden --help / -h     # list q-bw commands
 Queries that start with `>` are commands, not item names (defined in
 `$QBW_BASE/prefixes.toml`). Type the prefix and press **Enter**:
 
-- `>sync` / `>s` — run `bw sync` and refresh the daemon cache.
-- `>lock` / `>l` — lock the vault and forget the cached session.
+- `>sync` — run `bw sync` and refresh the daemon cache.
+- `>lock` — lock the vault and forget the cached session.
+- `>hide items` — hide the item list until you search for 3+ characters.
+- `>show items` — show the full item list again.
+
+#### Hiding the item list
+
+`>hide items` (or `quick-bitwarden hide-items`) keeps the vault out of the
+default view: the picker starts empty and only reveals items when the search
+is meaningful.
+
+- 3 or more characters: normal case-insensitive matching.
+- Fewer than 3 characters: only an item whose name is typed **exactly** (or
+  its short id) is shown.
+- The choice is stored in `$QBW_BASE/hide_items`, so it survives
+  `stop`/`restart` (and the daemon does not need to be restarted to pick it
+  up). `>show items` removes it.
 
 On tiling compositors (sway/Hyprland), float the window via its app id:
 
@@ -105,7 +122,7 @@ The program uses `bw`'s local cache. To pull the latest changes from your
 account run one of:
 
 - `quick-bitwarden sync`, or
-- the `>sync` (or `>s`) prefix inside the search window.
+- the `>sync` prefix inside the search window.
 
 Both run `bw sync` and refresh the in-memory cache, so the new items are
 available immediately. A notification tells you when the sync starts and
@@ -117,7 +134,7 @@ another when it ends. The cache also refreshes on its own once
 To lock the vault again and drop the session token and cached items:
 
 - `quick-bitwarden lock`, or
-- the `>lock` (or `>l`) prefix inside the search window.
+- the `>lock` prefix inside the search window.
 
 The next `show` asks for the master password again. The daemon keeps running.
 
@@ -153,8 +170,8 @@ The next `show` asks for the master password again. The daemon keeps running.
 - [x] Starts with system
 - [x] Remove from history clipboard
 - [x] Remove from user's clipboard in 20 seconds by default
-- [x] Sync the vault from the picker (`>sync` / `>s`) or with `quick-bitwarden sync`
-- [x] Lock the vault from the picker (`>lock` / `>l`) or with `quick-bitwarden lock`
+- [x] Sync the vault from the picker (`>sync`) or with `quick-bitwarden sync`
+- [x] Lock the vault from the picker (`>lock`) or with `quick-bitwarden lock`
 - [x] Install script
 
 **Flags**

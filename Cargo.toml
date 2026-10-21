@@ -15,8 +15,9 @@ path = "src/main.rs"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# The view/UI layer. Pinned to the revision this migration targets.
-r-modals = { git = "https://github.com/Kevin-Ramirez127/r-modals", rev = "130f713c547bf6421decf6f333a9c012d2514d39" }
+# The view/UI layer. Pinned to the revision with `min_match_chars`
+# (hidden item list until the query is long enough).
+r-modals = { git = "https://github.com/Kevin-Ramirez127/r-modals", rev = "572de45d13eb09be462e23d08b9499cbc0b17ad2" }
 
 # Ship a small, fast binary: `strip` + LTO + `panic = "abort"` cut the size
 # substantially, and every dialog is a short-lived child process, so a smaller

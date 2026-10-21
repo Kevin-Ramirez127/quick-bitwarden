@@ -269,9 +269,11 @@ fn show_error_via_child(msg: &str) -> bool {
 
 /// `--menu`: read `label<TAB>id` lines from stdin, pick one, print its label.
 ///
-/// The option `id` is set to the label so search stays label-only. Free-typed
-/// input is allowed, so a name absent from the list can still be forwarded to
-/// `bw get password`.
+/// The option `id` is the short label (the name without the trailing
+/// `  (username)`), so a hidden list can still reveal `Name  (user)` when the
+/// user types `Name` exactly. The full label remains the visible text and the
+/// value printed on selection. Free-typed input is allowed, so a name absent
+/// from the list can still be forwarded to `bw get password`.
 pub fn run_menu_child(paths: &Paths) -> i32 {
     // Read labels off the daemon in the background so the window can open and
     // show its loading message before `bw list items` has finished.
@@ -286,7 +288,8 @@ pub fn run_menu_child(paths: &Paths) -> i32 {
                 continue;
             }
             let label = line.split('\t').next().unwrap_or(line);
-            options.push(ModalOption::new(label, label));
+            let id = label.split("  (").next().unwrap_or(label);
+            options.push(ModalOption::new(id, label));
         }
         let _ = tx.send(options);
     });
@@ -298,6 +301,16 @@ pub fn run_menu_child(paths: &Paths) -> i32 {
         .allow_custom_input(true)
         .footer_hint("Enter copy · Esc cancel")
         .loading_message(LOADING_MESSAGE);
+
+    // Privacy mode (`>hide items`): keep the whole vault out of the default
+    // view. A 3+ character query filters normally; shorter queries only reveal
+    // an item typed in full.
+    if paths.items_hidden() {
+        modal = modal
+            .min_match_chars(3)
+            .placeholder("Type 3+ characters")
+            .empty_message("No matches — type 3+ characters or an exact name");
+    }
 
     // `>…` query prefixes (e.g. `>s` → sync), materialised by the daemon.
     let prefixes = paths.prefixes();
@@ -392,7 +405,7 @@ mod tests {
         let content = include_str!("../prefixes.toml").replace("{qbw}", "'/bin/quick-bitwarden'");
         let specs = r_modals::parse_prefixes(&content).expect("template parses");
         let prefixes: Vec<&str> = specs.iter().map(|s| s.prefix.as_str()).collect();
-        assert_eq!(prefixes, [">sync", ">s", ">lock", ">l"]);
+        assert_eq!(prefixes, [">sync", ">lock", ">hide items", ">show items"]);
         assert!(specs
             .iter()
             .all(|s| s.shell.as_deref().unwrap().contains("/bin/quick-bitwarden")));
@@ -416,7 +429,8 @@ mod tests {
             .map(|s| s.prefix)
             .collect();
         assert!(names.contains(&">lock".to_string()));
-        assert!(names.contains(&">l".to_string()));
+        assert!(names.contains(&">hide items".to_string()));
+        assert!(names.contains(&">show items".to_string()));
 
         // Simulate a file written by an older version: only sync. Re-running
         // must append the missing built-ins exactly once.
@@ -431,7 +445,7 @@ mod tests {
         let names: Vec<&str> = specs.iter().map(|s| s.prefix.as_str()).collect();
         assert_eq!(names.iter().filter(|n| **n == ">sync").count(), 1);
         assert!(names.contains(&">lock"));
-        assert!(names.contains(&">l"));
+        assert!(names.contains(&">hide items"));
 
         let _ = std::fs::remove_dir_all(&base);
     }
