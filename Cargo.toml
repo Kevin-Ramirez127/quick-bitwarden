@@ -17,7 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The view/UI layer. Pinned to the revision with the dialog backend and
 # `{exe}` config expansion.
-r-modals = { git = "https://github.com/Kevin-Ramirez127/r-modals", rev = "cb125ddd681d71b3e1e9c0ee0b07de849368e2cb" }
+r-modals = { git = "https://github.com/Kevin-Ramirez127/r-modals", rev = "c4aa9fff057a4699083ed0761689592d97783773" }
 
 # Ship a small, fast binary: `strip` + LTO + `panic = "abort"` cut the size
 # substantially, and every dialog is a short-lived child process, so a smaller
