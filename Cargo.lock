@@ -3002,13 +3002,14 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "r-modals"
 version = "0.2.0"
-source = "git+https://github.com/Kevin-Ramirez127/r-modals?rev=44e9c348e4790a5116c22992a40eeee8b8ab0033#44e9c348e4790a5116c22992a40eeee8b8ab0033"
+source = "git+https://github.com/Kevin-Ramirez127/r-modals?rev=0ddcf8a24ac8339890f15c07fa5381d190890ddf#0ddcf8a24ac8339890f15c07fa5381d190890ddf"
 dependencies = [
  "eframe",
  "egui",
  "image",
  "lightningcss",
  "serde",
+ "serde_json",
  "toml",
 ]
 

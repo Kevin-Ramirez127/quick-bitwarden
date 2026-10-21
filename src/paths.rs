@@ -20,7 +20,8 @@ pub struct Paths {
     pub pid: PathBuf,
     /// `$BASE/menu.pid` — picker/prompt child pid.
     pub menu_pid: PathBuf,
-    /// `$BASE/sel` — the picker's selection.
+    /// `$BASE/sel` — legacy selection file (truncated when a picker opens;
+    /// typed dialogs return the pick directly, but cleanup still removes it).
     pub sel: PathBuf,
     /// `QBW_CLEAR_AFTER` (default `20`) — clipboard clear delay.
     pub clear_after: u64,

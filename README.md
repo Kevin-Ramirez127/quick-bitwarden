@@ -101,7 +101,9 @@ Queries that start with `>` are commands, not item names (defined in
 #### Shortcuts
 
 Key bindings live in the same `$QBW_BASE/config.toml`, materialised by the
-daemon from a built-in template. By default:
+daemon from a built-in template. `{exe}` in an action is replaced with the
+running `quick-bitwarden` executable when the file is created (older configs
+that still contain `{qbw}` are upgraded in place). By default:
 
 - **Shift+Enter** picks the highlighted item but copies its **username**
   instead of the password.

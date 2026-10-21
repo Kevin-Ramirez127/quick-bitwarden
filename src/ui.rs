@@ -5,10 +5,9 @@
 //! child process (`--menu`, `--ask`, `--error`) so it can be killed from the
 //! outside, which keeps `hide` and `toggle` working.
 
-use std::io::{BufRead, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::Command;
 
-use r_modals::{Confirm, Modal, ModalOption, Prompt};
+use r_modals::{ConfigFile, Dialog, DialogOutput, DialogSession};
 
 use crate::paths::Paths;
 use crate::proc::command_exists;
@@ -16,23 +15,23 @@ use crate::proc::command_exists;
 /// Shown in the picker window until `bw list items` has produced a menu.
 const LOADING_MESSAGE: &str = "Loading your data from bw…";
 
+/// `${selection%%  (*}` — strip the trailing `  (username)` from a label.
+fn short_label(selection: &str) -> String {
+    match selection.find("  (") {
+        Some(i) => selection[..i].to_string(),
+        None => selection.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parent side: spawn the child dialogs and collect their result.
 // ---------------------------------------------------------------------------
 
-/// A spawned `--menu` child whose items may not be known yet.
+/// Open the picker window without waiting for vault data.
 ///
-/// The window opens immediately in its loading state; [`MenuSession::send_items`]
-/// delivers the menu (and closes stdin), then [`MenuSession::wait`] collects the
-/// selection.
-pub struct MenuSession {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    pid: i32,
-}
-
-/// `start_menu`: open the picker window without waiting for vault data.
-pub fn start_menu(paths: &Paths) -> Option<MenuSession> {
+/// The window starts in its loading state; [`fill_menu`] delivers the items and
+/// closes stdin, then [`DialogSession::wait`] collects the typed selection.
+pub fn start_menu(paths: &Paths) -> Option<DialogSession> {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => {
@@ -41,126 +40,103 @@ pub fn start_menu(paths: &Paths) -> Option<MenuSession> {
         }
     };
 
-    let mut child = match Command::new(exe)
-        .arg("--menu")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => {
-            error_dialog(paths, "Could not open the search window");
-            return None;
-        }
-    };
+    let mut dialog = Dialog::menu()
+        .program(exe)
+        .app_id("quick-bitwarden")
+        .pid_file(paths.menu_pid.clone())
+        .placeholder("Search")
+        .loading_message(LOADING_MESSAGE)
+        .allow_custom_input(true)
+        .footer_hint("Enter copy · Shift+Enter username · Esc cancel");
 
-    // `> "$SEL_FILE"` in the original: truncate up front so a cancel leaves an
-    // empty selection rather than a stale one.
+    // Privacy mode (`>hide items`): keep the whole vault out of the default
+    // view. A 3+ character query filters normally; shorter queries only reveal
+    // an item typed in full.
+    if paths.items_hidden() {
+        dialog = dialog
+            .min_match_chars(3)
+            .placeholder("Type 3+ characters")
+            .empty_message("No matches — type 3+ characters or an exact name");
+    }
+
+    // `$BASE/config.toml` holds both the `>…` query prefixes (e.g. `>s` → sync)
+    // and the keyboard shortcuts (e.g. Shift+Enter → copy the username).
+    let config = paths.config();
+    if config.is_file() {
+        dialog = dialog.config_file(config);
+    }
+
+    // Truncate up front so an interrupted run cannot leave a stale selection.
     let _ = std::fs::write(&paths.sel, b"");
 
-    let pid = child.id() as i32;
-    let _ = std::fs::write(&paths.menu_pid, format!("{pid}\n"));
-
-    let stdin = child.stdin.take();
-    Some(MenuSession { child, stdin, pid })
-}
-
-impl MenuSession {
-    /// Hand the picker its labels and close stdin, which tells the child the
-    /// list is complete.
-    pub fn send_items(&mut self, menu: &str) {
-        if let Some(mut stdin) = self.stdin.take() {
-            let _ = stdin.write_all(menu.as_bytes());
-            let _ = stdin.write_all(b"\n");
-        }
-    }
-
-    /// Close the window early (e.g. to show the password prompt instead) and
-    /// reap the child.
-    pub fn cancel(mut self, paths: &Paths) {
-        drop(self.stdin.take());
-        crate::proc::send_signal(self.pid, libc::SIGTERM);
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&paths.menu_pid);
-    }
-
-    /// Wait for the pick (or cancel) and write the chosen label to `sel`.
-    /// Returns `false` when the window could not be shown.
-    pub fn wait(mut self, paths: &Paths) -> bool {
-        drop(self.stdin.take());
-        let out = self.child.wait_with_output();
-        let _ = std::fs::remove_file(&paths.menu_pid);
-
-        match out {
-            Ok(out) => {
-                if out.status.code() == Some(2) {
-                    let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    if msg.is_empty() {
-                        error_dialog(paths, "Could not open the search window");
-                    } else {
-                        error_dialog(paths, &msg);
-                    }
-                    return false;
-                }
-                if out.status.success() {
-                    let _ = std::fs::write(&paths.sel, &out.stdout);
-                }
-                true
-            }
-            Err(_) => true,
+    match dialog.start() {
+        Ok(session) => Some(session),
+        Err(e) => {
+            error_dialog(paths, &format!("Could not open the search window: {e}"));
+            None
         }
     }
 }
 
-/// `launch_menu`: show the item picker with `menu` (one label per line) and,
-/// on a pick, drop the chosen label into `$BASE/sel`.
+/// Send the vault entries to the picker and close its input.
 ///
-/// Returns `false` when the window could not be shown.
-pub fn launch_menu(paths: &Paths, menu: &str) -> bool {
-    let Some(mut session) = start_menu(paths) else {
-        return false;
-    };
-    session.send_items(menu);
-    session.wait(paths)
+/// Each option id is the short label (`Name`, without `  (user)`), which keeps
+/// the hidden-list exact-name behaviour. The daemon maps the pick back to the
+/// real Bitwarden id through `tsv`.
+pub fn fill_menu(session: &mut DialogSession, tsv: &[(String, String)]) {
+    let options: Vec<(String, String)> = tsv
+        .iter()
+        .map(|(label, _id)| (short_label(label), label.clone()))
+        .collect();
+    let _ = session.send_options(options);
+    session.close_input();
 }
 
-/// `ask_password`: prompt for the master password (masked) and return it, or
-/// `None` when cancelled / unavailable.
+/// Show the picker for an already-loaded cache and wait for its result.
+pub fn show_menu(paths: &Paths, tsv: &[(String, String)]) -> Option<DialogOutput> {
+    let mut session = start_menu(paths)?;
+    fill_menu(&mut session, tsv);
+    match session.wait() {
+        Ok(output) => Some(output),
+        Err(e) => {
+            error_dialog(paths, &e.to_string());
+            None
+        }
+    }
+}
+
+/// Prompt for the master password (masked) and return it, or `None` when
+/// cancelled / unavailable.
 pub fn ask_password(paths: &Paths, label: &str) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
-    let child = Command::new(exe)
-        .arg("--ask")
-        .arg(label)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let output = Dialog::ask(label)
+        .program(exe)
+        .app_id("quick-bitwarden")
+        .placeholder(label)
+        .password(true)
+        .pid_file(paths.menu_pid.clone())
+        .run()
         .ok()?;
-
-    let pid = child.id() as i32;
-    let _ = std::fs::write(&paths.menu_pid, format!("{pid}\n"));
-
-    let out = child.wait_with_output();
-    let _ = std::fs::remove_file(&paths.menu_pid);
-
-    let out = out.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let pw = String::from_utf8_lossy(&out.stdout)
-        .trim_end_matches(['\n', '\r'])
-        .to_string();
-    if pw.is_empty() {
-        None
-    } else {
-        Some(pw)
+    match output {
+        DialogOutput::Text(pw) if !pw.is_empty() => Some(pw),
+        _ => None,
     }
 }
 
 /// `error_dialog`: show a message in an r-modals dialog. If that fails (no
 /// display) fall back to `notify-send`, then to `$BASE/error.log`.
 pub fn error_dialog(paths: &Paths, msg: &str) {
-    if show_error_via_child(msg) {
+    let shown = std::env::current_exe().ok().is_some_and(|exe| {
+        Dialog::error(msg)
+            .program(exe)
+            .app_id("quick-bitwarden")
+            .title("quick-bitwarden")
+            .confirm_label("OK")
+            .cancel_label("Close")
+            .run()
+            .is_ok()
+    });
+    if shown {
         return;
     }
     if command_exists("notify-send") {
@@ -195,7 +171,7 @@ pub fn notify_copied_field(kind: &str, label: &str, clear_after: u64) {
 }
 
 /// Materialise `$BASE/config.toml` from the embedded template, substituting
-/// `{qbw}` with the running executable.
+/// `{exe}` with the running executable.
 ///
 /// A single `config.toml` holds both the query prefixes and the keyboard
 /// shortcuts. An existing file is preserved, but any built-in entries added by
@@ -205,274 +181,33 @@ pub fn notify_copied_field(kind: &str, label: &str, clear_after: u64) {
 /// A `prefixes.toml`/`shortcuts.toml` from before the unification is migrated
 /// into the new file the first time the daemon starts.
 pub fn write_default_config(paths: &Paths) {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "quick-bitwarden".to_string());
+    let exe = shell_quote(&exe);
     let path = paths.config();
-    let template = include_str!("../config.toml");
-    let qbw = shell_quote(
-        &std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "quick-bitwarden".to_string()),
-    );
 
-    if !path.exists() {
-        match seed_legacy_config(paths) {
-            Some((content, migrated)) => {
-                if std::fs::write(&path, content).is_ok() {
-                    for legacy in migrated {
-                        let _ = std::fs::remove_file(legacy);
-                    }
-                }
-            }
-            None => {
-                let _ = std::fs::write(&path, template.replace("{qbw}", &qbw));
-            }
+    let _ = ConfigFile::at(&path)
+        .template(include_str!("../config.toml"))
+        .var("exe", &exe)
+        .migrate_from([
+            paths.base.join("prefixes.toml"),
+            paths.base.join("shortcuts.toml"),
+        ])
+        .ensure();
+
+    // Older versions wrote `{qbw}` into the file. Upgrade those entries in
+    // place; new files use `{exe}` exclusively.
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if text.contains("{qbw}") {
+            let _ = std::fs::write(&path, text.replace("{qbw}", &exe));
         }
     }
-
-    append_missing_entries(&path, template, "[[prefix]]", "prefix", &qbw, |c| {
-        r_modals::parse_prefixes(c)
-            .ok()
-            .map(|specs| specs.into_iter().map(|s| s.prefix).collect())
-    });
-    append_missing_entries(&path, template, "[[shortcut]]", "key", &qbw, |c| {
-        r_modals::parse_shortcuts(c)
-            .ok()
-            .map(|specs| specs.into_iter().map(|s| s.key).collect())
-    });
-}
-
-/// Content for a fresh `config.toml` built from pre-unification files, plus the
-/// files to remove once it has been written. `None` when neither exists.
-fn seed_legacy_config(paths: &Paths) -> Option<(String, Vec<std::path::PathBuf>)> {
-    let mut content = String::new();
-    let mut used = Vec::new();
-    for legacy in [
-        paths.base.join("prefixes.toml"),
-        paths.base.join("shortcuts.toml"),
-    ] {
-        let Ok(text) = std::fs::read_to_string(&legacy) else {
-            continue;
-        };
-        if text.trim().is_empty() {
-            continue;
-        }
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str(&text);
-        used.push(legacy);
-    }
-    (!content.is_empty()).then_some((content, used))
-}
-
-/// Append the built-in `[[section]]` entries that `path` lacks, keyed by
-/// `name_key`. A file that cannot be parsed is left alone: it is the user's to
-/// fix, and the picker reports it.
-fn append_missing_entries(
-    path: &std::path::Path,
-    template: &str,
-    section: &str,
-    name_key: &str,
-    qbw: &str,
-    existing_names: impl Fn(&str) -> Option<Vec<String>>,
-) {
-    let Ok(mut content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let Some(mut names) = existing_names(&content) else {
-        return;
-    };
-    let mut changed = false;
-    for (name, body) in embedded_blocks(template, section, name_key) {
-        if names.contains(&name) {
-            continue;
-        }
-        if !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push('\n');
-        content.push_str(section);
-        content.push('\n');
-        content.push_str(&body.replace("{qbw}", qbw));
-        names.push(name);
-        changed = true;
-    }
-    if changed {
-        let _ = std::fs::write(path, content);
-    }
-}
-
-/// Entry bodies of `section` in `template`, paired with their `name_key` value.
-///
-/// Only a line that starts a table (`[[…`) ends a body, so a comment that
-/// mentions a section name is never mistaken for one.
-fn embedded_blocks(template: &str, section: &str, name_key: &str) -> Vec<(String, String)> {
-    let needle = format!("{name_key} = \"");
-    let mut out = Vec::new();
-    let mut body: Option<String> = None;
-
-    fn flush(body: &mut Option<String>, out: &mut Vec<(String, String)>, needle: &str) {
-        let Some(text) = body.take() else {
-            return;
-        };
-        if let Some(name) = text
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(needle))
-            .and_then(|value| value.strip_suffix('"'))
-        {
-            out.push((name.to_string(), format!("{}\n", text.trim_end())));
-        }
-    }
-
-    for line in template.lines() {
-        let start = line.trim_start();
-        if start.starts_with("[[") {
-            flush(&mut body, &mut out, &needle);
-            if start == section {
-                body = Some(String::new());
-            }
-            continue;
-        }
-        if let Some(text) = body.as_mut() {
-            text.push_str(line);
-            text.push('\n');
-        }
-    }
-    flush(&mut body, &mut out, &needle);
-    out
 }
 
 /// Single-quote a word for `sh -c`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-fn show_error_via_child(msg: &str) -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    match Command::new(exe).arg("--error").arg(msg).status() {
-        Ok(status) => status.success(),
-        Err(_) => false,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Child side: run one dialog to completion and report through the exit code.
-// 0 = value printed · 1 = cancelled · 2 = backend error.
-// ---------------------------------------------------------------------------
-
-/// `--menu`: read `label<TAB>id` lines from stdin, pick one, print its label.
-///
-/// The option `id` is the short label (the name without the trailing
-/// `  (username)`), so a hidden list can still reveal `Name  (user)` when the
-/// user types `Name` exactly. The full label remains the visible text and the
-/// value printed on selection. Free-typed input is allowed, so a name absent
-/// from the list can still be forwarded to `bw get password`.
-pub fn run_menu_child(paths: &Paths) -> i32 {
-    // Read labels off the daemon in the background so the window can open and
-    // show its loading message before `bw list items` has finished.
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut options = Vec::new();
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else { break };
-            let line = line.strip_suffix('\r').unwrap_or(&line);
-            if line.is_empty() {
-                continue;
-            }
-            let label = line.split('\t').next().unwrap_or(line);
-            let id = label.split("  (").next().unwrap_or(label);
-            options.push(ModalOption::new(id, label));
-        }
-        let _ = tx.send(options);
-    });
-
-    let mut modal = Modal::new("Search")
-        .placeholder("Search")
-        .case_sensitive(false)
-        .app_id("quick-bitwarden")
-        .allow_custom_input(true)
-        .footer_hint("Enter copy · Shift+Enter username · Esc cancel")
-        .loading_message(LOADING_MESSAGE);
-
-    // Privacy mode (`>hide items`): keep the whole vault out of the default
-    // view. A 3+ character query filters normally; shorter queries only reveal
-    // an item typed in full.
-    if paths.items_hidden() {
-        modal = modal
-            .min_match_chars(3)
-            .placeholder("Type 3+ characters")
-            .empty_message("No matches — type 3+ characters or an exact name");
-    }
-
-    // `$BASE/config.toml` (materialised by the daemon) holds both the `>…`
-    // query prefixes (e.g. `>s` → sync) and the keyboard shortcuts
-    // (e.g. Shift+Enter → copy the username). Each parser ignores the other's
-    // section, so one file feeds both.
-    let config = paths.config();
-    if config.is_file() {
-        modal = modal.prefixes_file(config.clone()).shortcuts_file(config);
-    }
-
-    match modal.run_streaming(rx) {
-        Ok(Some(sel)) => {
-            // Line 1 is the shortcut tag (empty for a plain Enter/click); the
-            // rest is the label, so the daemon knows what to copy.
-            let tag = sel.shortcut.as_deref().unwrap_or("");
-            print!("{tag}\n{}", sel.label);
-            let _ = std::io::stdout().flush();
-            0
-        }
-        Ok(None) => 1,
-        Err(e) => {
-            eprintln!("quick-bitwarden: {e}");
-            2
-        }
-    }
-}
-
-/// `--ask <label>`: masked text prompt; prints the password on success.
-///
-/// The `Prompt` window is borderless, so the label must be rendered in the body
-/// (`.message`) and as the field hint (`.placeholder`) — the window title alone
-/// is never shown.
-pub fn run_ask_child(label: &str) -> i32 {
-    match Prompt::new(label)
-        .message(label)
-        .placeholder(label)
-        .password(true)
-        .app_id("quick-bitwarden")
-        .run()
-    {
-        Ok(Some(pw)) if !pw.is_empty() => {
-            print!("{pw}");
-            let _ = std::io::stdout().flush();
-            0
-        }
-        Ok(_) => 1,
-        Err(e) => {
-            eprintln!("quick-bitwarden: {e}");
-            2
-        }
-    }
-}
-
-/// `--error <message>`: one-button info dialog.
-pub fn run_error_child(msg: &str) -> i32 {
-    match Confirm::new("quick-bitwarden")
-        .message(msg)
-        .confirm_label("OK")
-        .cancel_label("Close")
-        .app_id("quick-bitwarden")
-        .run()
-    {
-        Ok(_) => 0,
-        Err(e) => {
-            eprintln!("quick-bitwarden: {e}");
-            2
-        }
-    }
 }
 
 #[cfg(test)]
@@ -493,6 +228,18 @@ mod tests {
         }
     }
 
+    fn temp_paths(name: &str) -> (std::path::PathBuf, Paths) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("qbw-{name}-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = paths_in(&base);
+        (base, paths)
+    }
+
     #[test]
     fn shell_quote_wraps_and_escapes() {
         assert_eq!(shell_quote("/usr/bin/qbw"), "'/usr/bin/qbw'");
@@ -502,7 +249,7 @@ mod tests {
 
     #[test]
     fn embedded_config_template_parses_both_sections() {
-        let content = include_str!("../config.toml").replace("{qbw}", "'/bin/quick-bitwarden'");
+        let content = include_str!("../config.toml").replace("{exe}", "'/bin/quick-bitwarden'");
 
         // One file: the prefix parser ignores `[[shortcut]]`, and vice versa.
         let prefixes = r_modals::parse_prefixes(&content).expect("prefixes parse");
@@ -515,7 +262,7 @@ mod tests {
             .contains("/bin/quick-bitwarden")));
         assert!(prefixes
             .iter()
-            .all(|s| !s.shell.as_deref().unwrap().contains("{qbw}")));
+            .all(|s| !s.shell.as_deref().unwrap().contains("{exe}")));
 
         let shortcuts = r_modals::parse_shortcuts(&content).expect("shortcuts parse");
         assert_eq!(shortcuts.len(), 1);
@@ -528,10 +275,7 @@ mod tests {
 
     #[test]
     fn existing_config_gains_new_builtins_once() {
-        let base = std::env::temp_dir().join(format!("qbw-config-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&base);
-        let paths = paths_in(&base);
-        let _ = std::fs::remove_file(paths.config());
+        let (base, paths) = temp_paths("config");
 
         // A file written by an older version: only one prefix, no shortcuts.
         std::fs::write(
@@ -566,26 +310,28 @@ mod tests {
 
     #[test]
     fn missing_config_is_materialised_from_the_template() {
-        let base = std::env::temp_dir().join(format!("qbw-fresh-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&base);
-        let paths = paths_in(&base);
-        let _ = std::fs::remove_file(paths.config());
+        let (base, paths) = temp_paths("fresh");
 
         write_default_config(&paths);
 
         let content = std::fs::read_to_string(paths.config()).unwrap();
-        assert!(r_modals::parse_prefixes(&content).unwrap().len() == 4);
-        assert!(r_modals::parse_shortcuts(&content).unwrap().len() == 1);
+        assert_eq!(r_modals::parse_prefixes(&content).unwrap().len(), 4);
+        assert_eq!(r_modals::parse_shortcuts(&content).unwrap().len(), 1);
+        assert!(!content.contains("{exe}"));
+        assert!(!content.contains("{qbw}"));
+
+        let exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(content.contains(&shell_quote(&exe)));
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn legacy_prefixes_and_shortcuts_are_migrated() {
-        let base = std::env::temp_dir().join(format!("qbw-legacy-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&base);
-        let paths = paths_in(&base);
-        let _ = std::fs::remove_file(paths.config());
+        let (base, paths) = temp_paths("legacy");
 
         let legacy_prefixes = paths.base.join("prefixes.toml");
         let legacy_shortcuts = paths.base.join("shortcuts.toml");
@@ -627,6 +373,40 @@ mod tests {
         let content2 = std::fs::read_to_string(paths.config()).unwrap();
         assert_eq!(content, content2);
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_qbw_tokens_are_upgraded_to_exe() {
+        let (base, paths) = temp_paths("legacy-token");
+        std::fs::write(
+            paths.config(),
+            "[[prefix]]\nprefix = \">sync\"\nshell = \"{qbw} sync\"\n",
+        )
+        .unwrap();
+
+        write_default_config(&paths);
+
+        let content = std::fs::read_to_string(paths.config()).unwrap();
+        assert!(!content.contains("{qbw}"));
+        let exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(content.contains(&shell_quote(&exe)));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn malformed_config_is_left_alone() {
+        let (base, paths) = temp_paths("malformed");
+        let broken = "this is not = valid toml\n[[prefix]\n";
+        std::fs::write(paths.config(), broken).unwrap();
+
+        write_default_config(&paths);
+
+        assert_eq!(std::fs::read_to_string(paths.config()).unwrap(), broken);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
