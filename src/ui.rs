@@ -47,7 +47,7 @@ pub fn start_menu(paths: &Paths) -> Option<DialogSession> {
         .placeholder("Search")
         .loading_message(LOADING_MESSAGE)
         .allow_custom_input(true)
-        .footer_hint("Enter copy · Shift+Enter username · Esc cancel");
+        .footer_hint("Enter copy · Shift+Enter username · Tab complete · Esc cancel");
 
     // Privacy mode (`>hide items`): keep the whole vault out of the default
     // view. A 3+ character query filters normally; shorter queries only reveal
