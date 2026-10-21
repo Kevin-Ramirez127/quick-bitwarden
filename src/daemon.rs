@@ -37,8 +37,7 @@ pub fn run_daemon(paths: &Paths) {
     };
 
     cleanup_stale(paths);
-    ui::write_default_prefixes(paths);
-    ui::write_default_shortcuts(paths);
+    ui::write_default_config(paths);
 
     // Menu state: `"<generation> <busy>"`. The daemon bumps the generation and
     // sets `busy` in one atomic write *before* doing any work, so a concurrent

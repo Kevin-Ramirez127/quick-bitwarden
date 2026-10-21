@@ -91,7 +91,7 @@ quick-bitwarden --help / -h     # list q-bw commands
 #### Prefixes
 
 Queries that start with `>` are commands, not item names (defined in
-`$QBW_BASE/prefixes.toml`). Type the prefix and press **Enter**:
+`$QBW_BASE/config.toml`, see below). Type the prefix and press **Enter**:
 
 - `>sync` — run `bw sync` and refresh the daemon cache.
 - `>lock` — lock the vault and forget the cached session.
@@ -100,17 +100,22 @@ Queries that start with `>` are commands, not item names (defined in
 
 #### Shortcuts
 
-Key bindings live in `$QBW_BASE/shortcuts.toml` (materialised by the daemon
-from a built-in template, like `prefixes.toml`). By default:
+Key bindings live in the same `$QBW_BASE/config.toml`, materialised by the
+daemon from a built-in template. By default:
 
 - **Shift+Enter** picks the highlighted item but copies its **username**
   instead of the password.
 
-A shortcut can pick the highlighted row with a tag (`pick = "username"`), or
-use any [r-modals](https://github.com/Kevin-Ramirez127/r-modals) target
-(`option`, `command`, `shell` + `args`) to add your own bindings. Edit the file
-and the next window picks the change up; a malformed file is reported by the
-picker instead of being overwritten.
+One file holds both kinds of entries: `[[prefix]]` tables (above) and
+`[[shortcut]]` tables. A shortcut can pick the highlighted row with a tag
+(`pick = "username"`), or use any
+[r-modals](https://github.com/Kevin-Ramirez127/r-modals) target (`option`,
+`command`, `shell` + `args`) to add your own bindings. Edit the file and the
+next window picks the change up; a malformed file is reported by the picker
+instead of being overwritten.
+
+`config.toml` replaces the separate `prefixes.toml`; a leftover `prefixes.toml`
+(or `shortcuts.toml`) is migrated into it on the next daemon start.
 
 #### Hiding the item list
 
