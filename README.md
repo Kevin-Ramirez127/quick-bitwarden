@@ -83,6 +83,7 @@ quick-bitwarden --help / -h     # list q-bw commands
 
 - Type the item name (or pick it from the list). Search is case-insensitive.
 - **Enter** copies the password and closes the window.
+- **Shift+Enter** copies the username instead of the password.
 - **Escape** just closes the window.
 - You can also type a name that is not listed and press Enter: it is forwarded
   to `bw get password`.
@@ -96,6 +97,20 @@ Queries that start with `>` are commands, not item names (defined in
 - `>lock` — lock the vault and forget the cached session.
 - `>hide items` — hide the item list until you search for 3+ characters.
 - `>show items` — show the full item list again.
+
+#### Shortcuts
+
+Key bindings live in `$QBW_BASE/shortcuts.toml` (materialised by the daemon
+from a built-in template, like `prefixes.toml`). By default:
+
+- **Shift+Enter** picks the highlighted item but copies its **username**
+  instead of the password.
+
+A shortcut can pick the highlighted row with a tag (`pick = "username"`), or
+use any [r-modals](https://github.com/Kevin-Ramirez127/r-modals) target
+(`option`, `command`, `shell` + `args`) to add your own bindings. Edit the file
+and the next window picks the change up; a malformed file is reported by the
+picker instead of being overwritten.
 
 #### Hiding the item list
 
@@ -172,6 +187,7 @@ The next `show` asks for the master password again. The daemon keeps running.
 - [x] Remove from user's clipboard in 20 seconds by default
 - [x] Sync the vault from the picker (`>sync`) or with `quick-bitwarden sync`
 - [x] Lock the vault from the picker (`>lock`) or with `quick-bitwarden lock`
+- [x] Copy the username instead of the password with Shift+Enter
 - [x] Install script
 
 **Flags**

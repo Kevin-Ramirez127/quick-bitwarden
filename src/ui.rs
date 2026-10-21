@@ -186,6 +186,14 @@ pub fn notify_copied(label: &str, clear_after: u64) {
     notify(&format!("Copied: {label} (clears in {clear_after}s)"));
 }
 
+/// `notify-send -t 3000 ...` after copying something other than the password
+/// (e.g. the username).
+pub fn notify_copied_field(kind: &str, label: &str, clear_after: u64) {
+    notify(&format!(
+        "Copied {kind}: {label} (clears in {clear_after}s)"
+    ));
+}
+
 /// Materialise `$BASE/prefixes.toml` from the embedded template, substituting
 /// `{qbw}` with the running executable.
 ///
@@ -193,56 +201,93 @@ pub fn notify_copied(label: &str, clear_after: u64) {
 /// version are appended, so upgrades pick up `>lock` without losing local
 /// customisations.
 pub fn write_default_prefixes(paths: &Paths) {
-    let path = paths.prefixes();
+    merge_default_config(
+        &paths.prefixes(),
+        include_str!("../prefixes.toml"),
+        "[[prefix]]",
+        "prefix",
+        |content| {
+            r_modals::parse_prefixes(content)
+                .ok()
+                .map(|specs| specs.into_iter().map(|s| s.prefix).collect())
+        },
+    );
+}
+
+/// Materialise `$BASE/shortcuts.toml` from the embedded template, the same way
+/// [`write_default_prefixes`] does for prefixes.
+pub fn write_default_shortcuts(paths: &Paths) {
+    merge_default_config(
+        &paths.shortcuts(),
+        include_str!("../shortcuts.toml"),
+        "[[shortcut]]",
+        "key",
+        |content| {
+            r_modals::parse_shortcuts(content)
+                .ok()
+                .map(|specs| specs.into_iter().map(|s| s.key).collect())
+        },
+    );
+}
+
+/// Write `template` to `path` when missing; otherwise keep the user's file but
+/// append the built-in `[[section]]` entries it lacks, keyed by `name_key`.
+fn merge_default_config(
+    path: &std::path::Path,
+    template: &str,
+    section: &str,
+    name_key: &str,
+    existing_names: impl Fn(&str) -> Option<Vec<String>>,
+) {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "quick-bitwarden".to_string());
     let qbw = shell_quote(&exe);
-    let template = include_str!("../prefixes.toml");
 
     if !path.exists() {
-        let _ = std::fs::write(&path, template.replace("{qbw}", &qbw));
+        let _ = std::fs::write(path, template.replace("{qbw}", &qbw));
         return;
     }
 
-    let Ok(mut content) = std::fs::read_to_string(&path) else {
+    let Ok(mut content) = std::fs::read_to_string(path) else {
         return;
     };
-    let Ok(specs) = r_modals::parse_prefixes(&content) else {
+    let Some(mut names) = existing_names(&content) else {
         // A malformed file is the user's to fix (the picker reports it too);
         // do not make it worse.
         return;
     };
-    let mut names: Vec<String> = specs.into_iter().map(|s| s.prefix).collect();
     let mut changed = false;
-    for (name, block) in embedded_prefix_blocks() {
-        if names.iter().any(|n| n == name) {
+    for (name, block) in embedded_blocks(template, section, name_key) {
+        if names.contains(&name) {
             continue;
         }
         if !content.ends_with('\n') {
             content.push('\n');
         }
-        content.push_str("\n[[prefix]]");
+        content.push('\n');
+        content.push_str(section);
         content.push_str(&block.replace("{qbw}", &qbw));
-        names.push(name.to_string());
+        names.push(name);
         changed = true;
     }
     if changed {
-        let _ = std::fs::write(&path, content);
+        let _ = std::fs::write(path, content);
     }
 }
 
-/// `[[prefix]]` blocks of the embedded template, paired with their prefix.
-fn embedded_prefix_blocks() -> Vec<(&'static str, &'static str)> {
-    include_str!("../prefixes.toml")
-        .split("[[prefix]]")
+/// `[[section]]` blocks of `template`, paired with their `name_key` value.
+fn embedded_blocks(template: &str, section: &str, name_key: &str) -> Vec<(String, String)> {
+    let needle = format!("{name_key} = \"");
+    template
+        .split(section)
         .skip(1)
         .filter_map(|block| {
             let name = block
                 .lines()
-                .find_map(|line| line.trim().strip_prefix("prefix = \""))?
+                .find_map(|line| line.trim().strip_prefix(&needle))?
                 .strip_suffix('"')?;
-            Some((name, block))
+            Some((name.to_string(), block.to_string()))
         })
         .collect()
 }
@@ -299,7 +344,7 @@ pub fn run_menu_child(paths: &Paths) -> i32 {
         .case_sensitive(false)
         .app_id("quick-bitwarden")
         .allow_custom_input(true)
-        .footer_hint("Enter copy · Esc cancel")
+        .footer_hint("Enter copy · Shift+Enter username · Esc cancel")
         .loading_message(LOADING_MESSAGE);
 
     // Privacy mode (`>hide items`): keep the whole vault out of the default
@@ -318,9 +363,19 @@ pub fn run_menu_child(paths: &Paths) -> i32 {
         modal = modal.prefixes_file(prefixes);
     }
 
+    // Keyboard shortcuts (e.g. Shift+Enter → copy the username), also
+    // materialised by the daemon.
+    let shortcuts = paths.shortcuts();
+    if shortcuts.is_file() {
+        modal = modal.shortcuts_file(shortcuts);
+    }
+
     match modal.run_streaming(rx) {
         Ok(Some(sel)) => {
-            print!("{}", sel.label);
+            // Line 1 is the shortcut tag (empty for a plain Enter/click); the
+            // rest is the label, so the daemon knows what to copy.
+            let tag = sel.shortcut.as_deref().unwrap_or("");
+            print!("{tag}\n{}", sel.label);
             let _ = std::io::stdout().flush();
             0
         }
@@ -377,7 +432,7 @@ pub fn run_error_child(msg: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_quote, write_default_prefixes};
+    use super::{shell_quote, write_default_prefixes, write_default_shortcuts};
     use crate::paths::Paths;
 
     fn paths_in(base: &std::path::Path) -> Paths {
@@ -446,6 +501,47 @@ mod tests {
         assert_eq!(names.iter().filter(|n| **n == ">sync").count(), 1);
         assert!(names.contains(&">lock"));
         assert!(names.contains(&">hide items"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn embedded_shortcuts_template_binds_shift_enter_to_username() {
+        let specs =
+            r_modals::parse_shortcuts(include_str!("../shortcuts.toml")).expect("template parses");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].key, "Shift+Enter");
+        assert_eq!(specs[0].pick.as_deref(), Some("username"));
+        assert!(specs[0].option.is_none());
+        assert!(specs[0].command.is_none());
+        assert!(specs[0].shell.is_none());
+    }
+
+    #[test]
+    fn existing_shortcut_files_gain_new_builtins() {
+        let base = std::env::temp_dir().join(format!("qbw-shortcuts-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let paths = paths_in(&base);
+        let _ = std::fs::remove_file(paths.shortcuts());
+
+        write_default_shortcuts(&paths);
+        let content = std::fs::read_to_string(paths.shortcuts()).unwrap();
+        let keys: Vec<String> = r_modals::parse_shortcuts(&content)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.key)
+            .collect();
+        assert!(keys.contains(&"Shift+Enter".to_string()));
+
+        // A file written by an older version (no shortcuts) gains the built-in
+        // exactly once.
+        std::fs::write(paths.shortcuts(), "").unwrap();
+        write_default_shortcuts(&paths);
+        write_default_shortcuts(&paths);
+        let content = std::fs::read_to_string(paths.shortcuts()).unwrap();
+        let specs = r_modals::parse_shortcuts(&content).unwrap();
+        let keys: Vec<&str> = specs.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(keys.iter().filter(|k| **k == "Shift+Enter").count(), 1);
 
         let _ = std::fs::remove_dir_all(&base);
     }

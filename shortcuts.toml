@@ -1,0 +1,16 @@
+# quick-bitwarden keyboard shortcuts.
+#
+# Bind a key combo to what happens when you pick a row in the search window.
+#
+#   pick = "<tag>"   pick the highlighted item and tag the pick:
+#                      "username" -> copy the username instead of the password
+#
+# The full r-modals shortcut format also works here (`option`, `command`,
+# `shell` + optional `args`), so you can add your own bindings.
+#
+# When the daemon starts it points the actions below at the running
+# quick-bitwarden executable, so they work no matter how it was started.
+
+[[shortcut]]
+key = "Shift+Enter"
+pick = "username"

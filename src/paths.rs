@@ -55,6 +55,11 @@ impl Paths {
         self.base.join("prefixes.toml")
     }
 
+    /// `$BASE/shortcuts.toml` — keyboard shortcuts loaded by the picker.
+    pub fn shortcuts(&self) -> PathBuf {
+        self.base.join("shortcuts.toml")
+    }
+
     /// `$BASE/hide_items` — present while the picker hides its item list until
     /// the query is long enough. Kept outside [`Paths::remove_runtime_files`]
     /// so `stop`/`restart` do not reset the user's choice.
