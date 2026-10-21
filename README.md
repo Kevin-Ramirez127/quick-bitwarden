@@ -92,8 +92,8 @@ quick-bitwarden --help / -h     # list q-bw commands
 Queries that start with `>` are commands, not item names (defined in
 `$QBW_BASE/prefixes.toml`). Type the prefix and press **Enter**:
 
-- `>sync` / `>s` — run `bw sync` and refresh the daemon cache.
-- `>lock` / `>l` — lock the vault and forget the cached session.
+- `>sync` — run `bw sync` and refresh the daemon cache.
+- `>lock` — lock the vault and forget the cached session.
 - `>hide items` — hide the item list until you search for 3+ characters.
 - `>show items` — show the full item list again.
 
@@ -122,7 +122,7 @@ The program uses `bw`'s local cache. To pull the latest changes from your
 account run one of:
 
 - `quick-bitwarden sync`, or
-- the `>sync` (or `>s`) prefix inside the search window.
+- the `>sync` prefix inside the search window.
 
 Both run `bw sync` and refresh the in-memory cache, so the new items are
 available immediately. A notification tells you when the sync starts and
@@ -134,7 +134,7 @@ another when it ends. The cache also refreshes on its own once
 To lock the vault again and drop the session token and cached items:
 
 - `quick-bitwarden lock`, or
-- the `>lock` (or `>l`) prefix inside the search window.
+- the `>lock` prefix inside the search window.
 
 The next `show` asks for the master password again. The daemon keeps running.
 
@@ -170,8 +170,8 @@ The next `show` asks for the master password again. The daemon keeps running.
 - [x] Starts with system
 - [x] Remove from history clipboard
 - [x] Remove from user's clipboard in 20 seconds by default
-- [x] Sync the vault from the picker (`>sync` / `>s`) or with `quick-bitwarden sync`
-- [x] Lock the vault from the picker (`>lock` / `>l`) or with `quick-bitwarden lock`
+- [x] Sync the vault from the picker (`>sync`) or with `quick-bitwarden sync`
+- [x] Lock the vault from the picker (`>lock`) or with `quick-bitwarden lock`
 - [x] Install script
 
 **Flags**

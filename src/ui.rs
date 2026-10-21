@@ -405,10 +405,7 @@ mod tests {
         let content = include_str!("../prefixes.toml").replace("{qbw}", "'/bin/quick-bitwarden'");
         let specs = r_modals::parse_prefixes(&content).expect("template parses");
         let prefixes: Vec<&str> = specs.iter().map(|s| s.prefix.as_str()).collect();
-        assert_eq!(
-            prefixes,
-            [">sync", ">s", ">lock", ">l", ">hide items", ">show items"]
-        );
+        assert_eq!(prefixes, [">sync", ">lock", ">hide items", ">show items"]);
         assert!(specs
             .iter()
             .all(|s| s.shell.as_deref().unwrap().contains("/bin/quick-bitwarden")));
@@ -432,7 +429,6 @@ mod tests {
             .map(|s| s.prefix)
             .collect();
         assert!(names.contains(&">lock".to_string()));
-        assert!(names.contains(&">l".to_string()));
         assert!(names.contains(&">hide items".to_string()));
         assert!(names.contains(&">show items".to_string()));
 
@@ -449,7 +445,7 @@ mod tests {
         let names: Vec<&str> = specs.iter().map(|s| s.prefix.as_str()).collect();
         assert_eq!(names.iter().filter(|n| **n == ">sync").count(), 1);
         assert!(names.contains(&">lock"));
-        assert!(names.contains(&">l"));
+        assert!(names.contains(&">hide items"));
 
         let _ = std::fs::remove_dir_all(&base);
     }
