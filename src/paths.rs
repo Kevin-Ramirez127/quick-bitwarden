@@ -50,9 +50,10 @@ impl Paths {
         self.base.join("error.log")
     }
 
-    /// `$BASE/prefixes.toml` — query prefixes loaded by the picker.
-    pub fn prefixes(&self) -> PathBuf {
-        self.base.join("prefixes.toml")
+    /// `$BASE/config.toml` — query prefixes and keyboard shortcuts loaded by
+    /// the picker.
+    pub fn config(&self) -> PathBuf {
+        self.base.join("config.toml")
     }
 
     /// `$BASE/hide_items` — present while the picker hides its item list until

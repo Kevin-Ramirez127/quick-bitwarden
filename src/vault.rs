@@ -20,6 +20,8 @@ pub struct State {
     pub tsv: Vec<(String, String)>,
     /// `id -> password`, kept in memory only.
     pub pass: HashMap<String, String>,
+    /// `id -> username`, kept in memory only.
+    pub user: HashMap<String, String>,
     /// Unix time of the last successful cache refresh.
     pub last_refresh: i64,
     /// Current `BW_SESSION` token, if any.
@@ -267,6 +269,7 @@ struct Cache {
     menu: String,
     tsv: Vec<(String, String)>,
     pass: HashMap<String, String>,
+    user: HashMap<String, String>,
 }
 
 impl Cache {
@@ -274,6 +277,7 @@ impl Cache {
         state.menu = self.menu;
         state.tsv = self.tsv;
         state.pass = self.pass;
+        state.user = self.user;
     }
 }
 
@@ -379,6 +383,7 @@ fn parse_cache(json: &[u8]) -> Option<Cache> {
     let mut tsv: Vec<(String, String)> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
     let mut pass: HashMap<String, String> = HashMap::new();
+    let mut user: HashMap<String, String> = HashMap::new();
 
     for item in &items {
         if item.kind != Some(1) {
@@ -410,19 +415,39 @@ fn parse_cache(json: &[u8]) -> Option<Cache> {
                 }
             }
         }
+
+        // Usernames are only needed for `Shift+Enter`; keep them out when empty.
+        if let Some(name) = item.login.as_ref().and_then(|l| l.username.clone()) {
+            if !name.is_empty() {
+                if let Some(id) = &item.id {
+                    user.insert(id.clone(), name);
+                }
+            }
+        }
     }
 
     Some(Cache {
         menu: labels.join("\n"),
         tsv,
         pass,
+        user,
     })
 }
 
 /// `bw get password <id-or-name>` fallback.
 pub fn bw_get_password(session: Option<&str>, id_or_name: &str) -> Option<String> {
+    bw_get(session, "password", id_or_name)
+}
+
+/// `bw get username <id-or-name>` fallback, used by `Shift+Enter`.
+pub fn bw_get_username(session: Option<&str>, id_or_name: &str) -> Option<String> {
+    bw_get(session, "username", id_or_name)
+}
+
+/// `bw get <field> <id-or-name>`.
+fn bw_get(session: Option<&str>, field: &str, id_or_name: &str) -> Option<String> {
     let mut cmd = Command::new("bw");
-    cmd.args(["get", "password", id_or_name]);
+    cmd.args(["get", field, id_or_name]);
     if let Some(s) = session {
         cmd.env("BW_SESSION", s);
     }
@@ -472,6 +497,15 @@ mod tests {
         // Empty passwords and non-login items stay out of the password table.
         assert!(!cache.pass.contains_key("id-nopass"));
         assert!(!cache.pass.contains_key("id-note"));
+
+        assert_eq!(
+            cache.user.get("id-github").map(String::as_str),
+            Some("octocat")
+        );
+        assert_eq!(cache.user.get("id-nopass").map(String::as_str), Some("u"));
+        // Empty usernames stay out too.
+        assert!(!cache.user.contains_key("id-gitlab"));
+        assert!(!cache.user.contains_key("id-note"));
     }
 
     #[test]
@@ -480,6 +514,7 @@ mod tests {
         assert!(cache.menu.is_empty());
         assert!(cache.tsv.is_empty());
         assert!(cache.pass.is_empty());
+        assert!(cache.user.is_empty());
     }
 
     #[test]

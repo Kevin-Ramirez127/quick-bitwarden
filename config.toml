@@ -1,0 +1,43 @@
+# quick-bitwarden configuration.
+#
+# One file holds both kinds of entries:
+#
+#   prefix entries     queries that start with ">" are commands, not item
+#                      names. Type the prefix in the search field and press
+#                      Enter to run it.
+#   shortcut entries   key bindings for the search window. `pick = "<tag>"`
+#                      picks the highlighted item, tagged for quick-bitwarden
+#                      ("username" copies the username instead of the
+#                      password); the r-modals targets option/command/shell
+#                      also work here.
+#
+# When the daemon starts it points the actions below at the running
+# quick-bitwarden executable, so they work no matter how it was started.
+
+# --- Prefixes ---------------------------------------------------------------
+
+[[prefix]]
+prefix = ">sync"
+shell = "{qbw} sync"
+hint = "Sync the vault"
+
+[[prefix]]
+prefix = ">lock"
+shell = "{qbw} lock"
+hint = "Lock the vault"
+
+[[prefix]]
+prefix = ">hide items"
+shell = "{qbw} hide-items"
+hint = "Hide the item list until a 3+ character search"
+
+[[prefix]]
+prefix = ">show items"
+shell = "{qbw} show-items"
+hint = "Show the full item list"
+
+# --- Shortcuts --------------------------------------------------------------
+
+[[shortcut]]
+key = "Shift+Enter"
+pick = "username"

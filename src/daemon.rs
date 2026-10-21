@@ -37,7 +37,7 @@ pub fn run_daemon(paths: &Paths) {
     };
 
     cleanup_stale(paths);
-    ui::write_default_prefixes(paths);
+    ui::write_default_config(paths);
 
     // Menu state: `"<generation> <busy>"`. The daemon bumps the generation and
     // sets `busy` in one atomic write *before* doing any work, so a concurrent
@@ -217,50 +217,74 @@ fn do_show(state: &mut State, paths: &Paths) {
 
     let selection = std::fs::read_to_string(&paths.sel).unwrap_or_default();
     let _ = std::fs::remove_file(&paths.sel);
-    let selection = selection.trim_end_matches(['\n', '\r']).to_string();
-    if selection.is_empty() {
+    // The picker prints `<shortcut-tag>\n<label>`; a plain Enter/click leaves
+    // the tag empty. `username` means Shift+Enter: copy the username instead.
+    let (tag, label) = match selection.split_once('\n') {
+        Some((tag, rest)) => (tag.trim().to_string(), rest.to_string()),
+        None => (String::new(), selection),
+    };
+    let label = label.trim_end_matches(['\n', '\r']).to_string();
+    if label.is_empty() {
         return;
     }
+    let copy_username = tag == "username";
 
     // First label match wins, like `awk '$1 == s { print $2; exit }'`.
     let id = state
         .tsv
         .iter()
-        .find(|(label, _)| label == &selection)
+        .find(|(name, _)| name == &label)
         .map(|(_, id)| id.clone());
 
-    let mut password = id
+    let mut value = id
         .as_ref()
-        .and_then(|id| state.pass.get(id).cloned())
+        .and_then(|id| {
+            if copy_username {
+                state.user.get(id)
+            } else {
+                state.pass.get(id)
+            }
+        })
+        .cloned()
         .unwrap_or_default();
 
-    if password.is_empty() {
-        let lookup = id.clone().unwrap_or_else(|| selection.clone());
-        password = vault::bw_get_password(state.session.as_deref(), &lookup).unwrap_or_default();
-        if password.is_empty() {
-            ui::error_dialog(
-                paths,
-                &format!("Could not fetch password for '{selection}'"),
-            );
+    if value.is_empty() {
+        let lookup = id.clone().unwrap_or_else(|| label.clone());
+        value = if copy_username {
+            vault::bw_get_username(state.session.as_deref(), &lookup).unwrap_or_default()
+        } else {
+            vault::bw_get_password(state.session.as_deref(), &lookup).unwrap_or_default()
+        };
+        if value.is_empty() {
+            let what = if copy_username {
+                "username"
+            } else {
+                "password"
+            };
+            ui::error_dialog(paths, &format!("Could not fetch {what} for '{label}'"));
             return;
         }
     }
 
-    if !clipboard::copy_password(&password) {
+    if !clipboard::copy_password(&value) {
         ui::error_dialog(paths, "Clipboard tool missing (wl-copy, xclip or xsel)");
         return;
     }
 
     {
-        let pw = password.clone();
-        std::thread::spawn(move || clipboard::remove_from_history(&pw));
+        let copied = value.clone();
+        std::thread::spawn(move || clipboard::remove_from_history(&copied));
     }
     {
         let clear_after = paths.clear_after;
         std::thread::spawn(move || clipboard::clear_password(clear_after));
     }
 
-    ui::notify_copied(&short_label(&selection), paths.clear_after);
+    if copy_username {
+        ui::notify_copied_field("username", &short_label(&label), paths.clear_after);
+    } else {
+        ui::notify_copied(&short_label(&label), paths.clear_after);
+    }
 }
 
 /// `sync`: run `bw sync`, then rebuild the in-memory cache from the fresh data.
@@ -290,6 +314,7 @@ fn do_lock(state: &mut State, paths: &Paths) {
     state.menu.clear();
     state.tsv.clear();
     state.pass.clear();
+    state.user.clear();
     state.last_refresh = 0;
     state.unlocked = Some(false);
     ui::notify("Vault locked");

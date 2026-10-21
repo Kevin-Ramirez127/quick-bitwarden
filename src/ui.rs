@@ -186,65 +186,159 @@ pub fn notify_copied(label: &str, clear_after: u64) {
     notify(&format!("Copied: {label} (clears in {clear_after}s)"));
 }
 
-/// Materialise `$BASE/prefixes.toml` from the embedded template, substituting
+/// `notify-send -t 3000 ...` after copying something other than the password
+/// (e.g. the username).
+pub fn notify_copied_field(kind: &str, label: &str, clear_after: u64) {
+    notify(&format!(
+        "Copied {kind}: {label} (clears in {clear_after}s)"
+    ));
+}
+
+/// Materialise `$BASE/config.toml` from the embedded template, substituting
 /// `{qbw}` with the running executable.
 ///
-/// An existing file is preserved, but any built-in prefixes added by a newer
-/// version are appended, so upgrades pick up `>lock` without losing local
-/// customisations.
-pub fn write_default_prefixes(paths: &Paths) {
-    let path = paths.prefixes();
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "quick-bitwarden".to_string());
-    let qbw = shell_quote(&exe);
-    let template = include_str!("../prefixes.toml");
+/// A single `config.toml` holds both the query prefixes and the keyboard
+/// shortcuts. An existing file is preserved, but any built-in entries added by
+/// a newer version are appended (per section), so upgrades pick up `>lock`
+/// without losing local customisations.
+///
+/// A `prefixes.toml`/`shortcuts.toml` from before the unification is migrated
+/// into the new file the first time the daemon starts.
+pub fn write_default_config(paths: &Paths) {
+    let path = paths.config();
+    let template = include_str!("../config.toml");
+    let qbw = shell_quote(
+        &std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "quick-bitwarden".to_string()),
+    );
 
     if !path.exists() {
-        let _ = std::fs::write(&path, template.replace("{qbw}", &qbw));
-        return;
+        match seed_legacy_config(paths) {
+            Some((content, migrated)) => {
+                if std::fs::write(&path, content).is_ok() {
+                    for legacy in migrated {
+                        let _ = std::fs::remove_file(legacy);
+                    }
+                }
+            }
+            None => {
+                let _ = std::fs::write(&path, template.replace("{qbw}", &qbw));
+            }
+        }
     }
 
-    let Ok(mut content) = std::fs::read_to_string(&path) else {
+    append_missing_entries(&path, template, "[[prefix]]", "prefix", &qbw, |c| {
+        r_modals::parse_prefixes(c)
+            .ok()
+            .map(|specs| specs.into_iter().map(|s| s.prefix).collect())
+    });
+    append_missing_entries(&path, template, "[[shortcut]]", "key", &qbw, |c| {
+        r_modals::parse_shortcuts(c)
+            .ok()
+            .map(|specs| specs.into_iter().map(|s| s.key).collect())
+    });
+}
+
+/// Content for a fresh `config.toml` built from pre-unification files, plus the
+/// files to remove once it has been written. `None` when neither exists.
+fn seed_legacy_config(paths: &Paths) -> Option<(String, Vec<std::path::PathBuf>)> {
+    let mut content = String::new();
+    let mut used = Vec::new();
+    for legacy in [
+        paths.base.join("prefixes.toml"),
+        paths.base.join("shortcuts.toml"),
+    ] {
+        let Ok(text) = std::fs::read_to_string(&legacy) else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&text);
+        used.push(legacy);
+    }
+    (!content.is_empty()).then_some((content, used))
+}
+
+/// Append the built-in `[[section]]` entries that `path` lacks, keyed by
+/// `name_key`. A file that cannot be parsed is left alone: it is the user's to
+/// fix, and the picker reports it.
+fn append_missing_entries(
+    path: &std::path::Path,
+    template: &str,
+    section: &str,
+    name_key: &str,
+    qbw: &str,
+    existing_names: impl Fn(&str) -> Option<Vec<String>>,
+) {
+    let Ok(mut content) = std::fs::read_to_string(path) else {
         return;
     };
-    let Ok(specs) = r_modals::parse_prefixes(&content) else {
-        // A malformed file is the user's to fix (the picker reports it too);
-        // do not make it worse.
+    let Some(mut names) = existing_names(&content) else {
         return;
     };
-    let mut names: Vec<String> = specs.into_iter().map(|s| s.prefix).collect();
     let mut changed = false;
-    for (name, block) in embedded_prefix_blocks() {
-        if names.iter().any(|n| n == name) {
+    for (name, body) in embedded_blocks(template, section, name_key) {
+        if names.contains(&name) {
             continue;
         }
         if !content.ends_with('\n') {
             content.push('\n');
         }
-        content.push_str("\n[[prefix]]");
-        content.push_str(&block.replace("{qbw}", &qbw));
-        names.push(name.to_string());
+        content.push('\n');
+        content.push_str(section);
+        content.push('\n');
+        content.push_str(&body.replace("{qbw}", qbw));
+        names.push(name);
         changed = true;
     }
     if changed {
-        let _ = std::fs::write(&path, content);
+        let _ = std::fs::write(path, content);
     }
 }
 
-/// `[[prefix]]` blocks of the embedded template, paired with their prefix.
-fn embedded_prefix_blocks() -> Vec<(&'static str, &'static str)> {
-    include_str!("../prefixes.toml")
-        .split("[[prefix]]")
-        .skip(1)
-        .filter_map(|block| {
-            let name = block
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("prefix = \""))?
-                .strip_suffix('"')?;
-            Some((name, block))
-        })
-        .collect()
+/// Entry bodies of `section` in `template`, paired with their `name_key` value.
+///
+/// Only a line that starts a table (`[[…`) ends a body, so a comment that
+/// mentions a section name is never mistaken for one.
+fn embedded_blocks(template: &str, section: &str, name_key: &str) -> Vec<(String, String)> {
+    let needle = format!("{name_key} = \"");
+    let mut out = Vec::new();
+    let mut body: Option<String> = None;
+
+    fn flush(body: &mut Option<String>, out: &mut Vec<(String, String)>, needle: &str) {
+        let Some(text) = body.take() else {
+            return;
+        };
+        if let Some(name) = text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(needle))
+            .and_then(|value| value.strip_suffix('"'))
+        {
+            out.push((name.to_string(), format!("{}\n", text.trim_end())));
+        }
+    }
+
+    for line in template.lines() {
+        let start = line.trim_start();
+        if start.starts_with("[[") {
+            flush(&mut body, &mut out, &needle);
+            if start == section {
+                body = Some(String::new());
+            }
+            continue;
+        }
+        if let Some(text) = body.as_mut() {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    flush(&mut body, &mut out, &needle);
+    out
 }
 
 /// Single-quote a word for `sh -c`.
@@ -299,7 +393,7 @@ pub fn run_menu_child(paths: &Paths) -> i32 {
         .case_sensitive(false)
         .app_id("quick-bitwarden")
         .allow_custom_input(true)
-        .footer_hint("Enter copy · Esc cancel")
+        .footer_hint("Enter copy · Shift+Enter username · Esc cancel")
         .loading_message(LOADING_MESSAGE);
 
     // Privacy mode (`>hide items`): keep the whole vault out of the default
@@ -312,15 +406,21 @@ pub fn run_menu_child(paths: &Paths) -> i32 {
             .empty_message("No matches — type 3+ characters or an exact name");
     }
 
-    // `>…` query prefixes (e.g. `>s` → sync), materialised by the daemon.
-    let prefixes = paths.prefixes();
-    if prefixes.is_file() {
-        modal = modal.prefixes_file(prefixes);
+    // `$BASE/config.toml` (materialised by the daemon) holds both the `>…`
+    // query prefixes (e.g. `>s` → sync) and the keyboard shortcuts
+    // (e.g. Shift+Enter → copy the username). Each parser ignores the other's
+    // section, so one file feeds both.
+    let config = paths.config();
+    if config.is_file() {
+        modal = modal.prefixes_file(config.clone()).shortcuts_file(config);
     }
 
     match modal.run_streaming(rx) {
         Ok(Some(sel)) => {
-            print!("{}", sel.label);
+            // Line 1 is the shortcut tag (empty for a plain Enter/click); the
+            // rest is the label, so the daemon knows what to copy.
+            let tag = sel.shortcut.as_deref().unwrap_or("");
+            print!("{tag}\n{}", sel.label);
             let _ = std::io::stdout().flush();
             0
         }
@@ -377,7 +477,7 @@ pub fn run_error_child(msg: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_quote, write_default_prefixes};
+    use super::{shell_quote, write_default_config};
     use crate::paths::Paths;
 
     fn paths_in(base: &std::path::Path) -> Paths {
@@ -401,51 +501,131 @@ mod tests {
     }
 
     #[test]
-    fn embedded_prefixes_template_parses() {
-        let content = include_str!("../prefixes.toml").replace("{qbw}", "'/bin/quick-bitwarden'");
-        let specs = r_modals::parse_prefixes(&content).expect("template parses");
-        let prefixes: Vec<&str> = specs.iter().map(|s| s.prefix.as_str()).collect();
-        assert_eq!(prefixes, [">sync", ">lock", ">hide items", ">show items"]);
-        assert!(specs
-            .iter()
-            .all(|s| s.shell.as_deref().unwrap().contains("/bin/quick-bitwarden")));
-        assert!(specs
+    fn embedded_config_template_parses_both_sections() {
+        let content = include_str!("../config.toml").replace("{qbw}", "'/bin/quick-bitwarden'");
+
+        // One file: the prefix parser ignores `[[shortcut]]`, and vice versa.
+        let prefixes = r_modals::parse_prefixes(&content).expect("prefixes parse");
+        let names: Vec<&str> = prefixes.iter().map(|s| s.prefix.as_str()).collect();
+        assert_eq!(names, [">sync", ">lock", ">hide items", ">show items"]);
+        assert!(prefixes.iter().all(|s| s
+            .shell
+            .as_deref()
+            .unwrap()
+            .contains("/bin/quick-bitwarden")));
+        assert!(prefixes
             .iter()
             .all(|s| !s.shell.as_deref().unwrap().contains("{qbw}")));
+
+        let shortcuts = r_modals::parse_shortcuts(&content).expect("shortcuts parse");
+        assert_eq!(shortcuts.len(), 1);
+        assert_eq!(shortcuts[0].key, "Shift+Enter");
+        assert_eq!(shortcuts[0].pick.as_deref(), Some("username"));
+        assert!(shortcuts[0].option.is_none());
+        assert!(shortcuts[0].command.is_none());
+        assert!(shortcuts[0].shell.is_none());
     }
 
     #[test]
-    fn existing_prefix_files_gain_new_builtins() {
-        let base = std::env::temp_dir().join(format!("qbw-prefixes-{}", std::process::id()));
+    fn existing_config_gains_new_builtins_once() {
+        let base = std::env::temp_dir().join(format!("qbw-config-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&base);
         let paths = paths_in(&base);
-        let _ = std::fs::remove_file(paths.prefixes());
+        let _ = std::fs::remove_file(paths.config());
 
-        write_default_prefixes(&paths);
-        let content = std::fs::read_to_string(paths.prefixes()).unwrap();
-        let names: Vec<String> = r_modals::parse_prefixes(&content)
+        // A file written by an older version: only one prefix, no shortcuts.
+        std::fs::write(
+            paths.config(),
+            "[[prefix]]\nprefix = \">sync\"\nshell = \"true\"\nhint = \"Sync\"\n",
+        )
+        .unwrap();
+        write_default_config(&paths);
+        // Re-running must not duplicate a built-in.
+        write_default_config(&paths);
+
+        let content = std::fs::read_to_string(paths.config()).unwrap();
+        let prefixes: Vec<String> = r_modals::parse_prefixes(&content)
             .unwrap()
             .into_iter()
             .map(|s| s.prefix)
             .collect();
-        assert!(names.contains(&">lock".to_string()));
-        assert!(names.contains(&">hide items".to_string()));
-        assert!(names.contains(&">show items".to_string()));
+        assert_eq!(prefixes.iter().filter(|n| *n == ">sync").count(), 1);
+        assert!(prefixes.contains(&">lock".to_string()));
+        assert!(prefixes.contains(&">hide items".to_string()));
+        assert!(prefixes.contains(&">show items".to_string()));
 
-        // Simulate a file written by an older version: only sync. Re-running
-        // must append the missing built-ins exactly once.
+        let shortcuts: Vec<String> = r_modals::parse_shortcuts(&content)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.key)
+            .collect();
+        assert_eq!(shortcuts.iter().filter(|k| *k == "Shift+Enter").count(), 1);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn missing_config_is_materialised_from_the_template() {
+        let base = std::env::temp_dir().join(format!("qbw-fresh-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let paths = paths_in(&base);
+        let _ = std::fs::remove_file(paths.config());
+
+        write_default_config(&paths);
+
+        let content = std::fs::read_to_string(paths.config()).unwrap();
+        assert!(r_modals::parse_prefixes(&content).unwrap().len() == 4);
+        assert!(r_modals::parse_shortcuts(&content).unwrap().len() == 1);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_prefixes_and_shortcuts_are_migrated() {
+        let base = std::env::temp_dir().join(format!("qbw-legacy-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let paths = paths_in(&base);
+        let _ = std::fs::remove_file(paths.config());
+
+        let legacy_prefixes = paths.base.join("prefixes.toml");
+        let legacy_shortcuts = paths.base.join("shortcuts.toml");
         std::fs::write(
-            paths.prefixes(),
-            "[[prefix]]\nprefix = \">sync\"\nshell = \"true\"\nhint = \"Sync\"\n",
+            &legacy_prefixes,
+            "[[prefix]]\nprefix = \">custom\"\nshell = \"true\"\nhint = \"Mine\"\n",
         )
         .unwrap();
-        write_default_prefixes(&paths);
-        let content = std::fs::read_to_string(paths.prefixes()).unwrap();
-        let specs = r_modals::parse_prefixes(&content).unwrap();
-        let names: Vec<&str> = specs.iter().map(|s| s.prefix.as_str()).collect();
-        assert_eq!(names.iter().filter(|n| **n == ">sync").count(), 1);
-        assert!(names.contains(&">lock"));
-        assert!(names.contains(&">hide items"));
+        std::fs::write(
+            &legacy_shortcuts,
+            "[[shortcut]]\nkey = \"Ctrl+U\"\npick = \"username\"\n",
+        )
+        .unwrap();
+
+        write_default_config(&paths);
+
+        // The custom entries survive, the built-ins were added, and the old
+        // files are gone.
+        let content = std::fs::read_to_string(paths.config()).unwrap();
+        let prefixes: Vec<String> = r_modals::parse_prefixes(&content)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.prefix)
+            .collect();
+        assert!(prefixes.contains(&">custom".to_string()));
+        assert!(prefixes.contains(&">lock".to_string()));
+        let keys: Vec<String> = r_modals::parse_shortcuts(&content)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.key)
+            .collect();
+        assert!(keys.contains(&"Ctrl+U".to_string()));
+        assert!(keys.contains(&"Shift+Enter".to_string()));
+        assert!(!legacy_prefixes.exists());
+        assert!(!legacy_shortcuts.exists());
+
+        // Idempotent: a second run leaves a migrated file alone.
+        write_default_config(&paths);
+        let content2 = std::fs::read_to_string(paths.config()).unwrap();
+        assert_eq!(content, content2);
 
         let _ = std::fs::remove_dir_all(&base);
     }
