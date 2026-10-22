@@ -11,29 +11,30 @@
 #                      password); the r-modals targets option/command/shell
 #                      also work here.
 #
-# When the daemon starts it points the actions below at the running
-# quick-bitwarden executable, so they work no matter how it was started.
+# `{exe}` is replaced with the running quick-bitwarden executable when the
+# file is created (and in built-in entries appended on upgrade), so the actions
+# work no matter how the binary was started.
 
 # --- Prefixes ---------------------------------------------------------------
 
 [[prefix]]
 prefix = ">sync"
-shell = "{qbw} sync"
+shell = "{exe} sync"
 hint = "Sync the vault"
 
 [[prefix]]
 prefix = ">lock"
-shell = "{qbw} lock"
+shell = "{exe} lock"
 hint = "Lock the vault"
 
 [[prefix]]
 prefix = ">hide items"
-shell = "{qbw} hide-items"
+shell = "{exe} hide-items"
 hint = "Hide the item list until a 3+ character search"
 
 [[prefix]]
 prefix = ">show items"
-shell = "{qbw} show-items"
+shell = "{exe} show-items"
 hint = "Show the full item list"
 
 # --- Shortcuts --------------------------------------------------------------

@@ -51,20 +51,16 @@ fn main() {
     // `umask 077`: session/IPC files are private to the user.
     unsafe { libc::umask(0o077) };
 
+    // Dialog children spawned by `r_modals::Dialog` (the picker, the password
+    // prompt, and error dialogs) re-enter this binary with a mode flag. Handle
+    // them before any quick-bitwarden command parsing.
+    r_modals::dialog_main!();
+
     let paths = Paths::new();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.first().map(String::as_str) {
         Some("--daemon") => daemon::run_daemon(&paths),
-        Some("--menu") => std::process::exit(ui::run_menu_child(&paths)),
-        Some("--ask") => {
-            let label = args.get(1).map(String::as_str).unwrap_or("Master password");
-            std::process::exit(ui::run_ask_child(label));
-        }
-        Some("--error") => {
-            let message = args.get(1).map(String::as_str).unwrap_or("");
-            std::process::exit(ui::run_error_child(message));
-        }
         Some("-h") | Some("--help") => usage(),
         Some("-v") | Some("--version") => println!("quick-bitwarden {VERSION}"),
         Some("show") => commands::cmd_show(&paths),

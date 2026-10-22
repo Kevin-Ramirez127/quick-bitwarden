@@ -155,7 +155,7 @@ pub fn run_daemon(paths: &Paths) {
 /// `do_show`: pick an item, copy its password, then scrub history and schedule
 /// the clipboard clear.
 fn do_show(state: &mut State, paths: &Paths) {
-    if state.menu.is_empty() {
+    let picked = if state.menu.is_empty() {
         // Prompt first when we already know the vault needs it, so the
         // loading window never covers the master-password dialog.
         if vault::needs_prompt(state, paths) && !vault::prompt_and_unlock(state, paths) {
@@ -172,7 +172,7 @@ fn do_show(state: &mut State, paths: &Paths) {
         if matches!(load, vault::Load::NeedsPassword) {
             // The stored session was stale. Swap the loading window for the
             // password prompt, then reopen it for the actual load.
-            session.cancel(paths);
+            let _ = session.cancel();
             if !vault::prompt_and_unlock(state, paths) {
                 return;
             }
@@ -186,55 +186,64 @@ fn do_show(state: &mut State, paths: &Paths) {
         match load {
             vault::Load::Loaded => {}
             vault::Load::NeedsPassword => {
-                session.cancel(paths);
+                let _ = session.cancel();
                 return;
             }
             vault::Load::Unauthenticated => {
-                session.cancel(paths);
+                let _ = session.cancel();
                 ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
                 return;
             }
             vault::Load::Failed => {
-                session.cancel(paths);
+                let _ = session.cancel();
                 ui::error_dialog(paths, "Could not read the vault");
                 return;
             }
         }
 
         if state.menu.is_empty() {
-            session.cancel(paths);
+            let _ = session.cancel();
             ui::error_dialog(paths, "No login items in the vault");
             return;
         }
 
-        session.send_items(&state.menu);
-        if !session.wait(paths) {
-            return;
+        ui::fill_menu(&mut session, &state.tsv);
+        match session.wait() {
+            Ok(r_modals::DialogOutput::Picked(sel)) => sel,
+            Ok(_) => return,
+            Err(e) => {
+                ui::error_dialog(paths, &e.to_string());
+                return;
+            }
         }
-    } else if !ui::launch_menu(paths, &state.menu) {
-        return;
-    }
-
-    let selection = std::fs::read_to_string(&paths.sel).unwrap_or_default();
-    let _ = std::fs::remove_file(&paths.sel);
-    // The picker prints `<shortcut-tag>\n<label>`; a plain Enter/click leaves
-    // the tag empty. `username` means Shift+Enter: copy the username instead.
-    let (tag, label) = match selection.split_once('\n') {
-        Some((tag, rest)) => (tag.trim().to_string(), rest.to_string()),
-        None => (String::new(), selection),
+    } else {
+        match ui::show_menu(paths, &state.tsv) {
+            Some(r_modals::DialogOutput::Picked(sel)) => sel,
+            _ => return,
+        }
     };
-    let label = label.trim_end_matches(['\n', '\r']).to_string();
+
+    let copy_username = picked.shortcut.as_deref() == Some("username");
+    let label = picked.label.trim_end_matches(['\n', '\r']).to_string();
     if label.is_empty() {
         return;
     }
-    let copy_username = tag == "username";
 
-    // First label match wins, like `awk '$1 == s { print $2; exit }'`.
+    // The picker's option id is the short label, so the hidden-list exact-name
+    // path still works. Resolve the corresponding Bitwarden id from `tsv`,
+    // preferring the exact displayed label so duplicate names stay unambiguous.
     let id = state
         .tsv
         .iter()
         .find(|(name, _)| name == &label)
-        .map(|(_, id)| id.clone());
+        .map(|(_, id)| id.clone())
+        .or_else(|| {
+            state
+                .tsv
+                .iter()
+                .find(|(name, _)| short_label(name) == picked.id)
+                .map(|(_, id)| id.clone())
+        });
 
     let mut value = id
         .as_ref()

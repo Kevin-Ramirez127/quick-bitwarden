@@ -15,10 +15,9 @@ path = "src/main.rs"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# The view/UI layer. Pinned to the revision with `min_match_chars`
-# (hidden item list until the query is long enough) and the `pick` shortcut
-# target (Shift+Enter picks the row tagged `username`).
-r-modals = { git = "https://github.com/Kevin-Ramirez127/r-modals", rev = "44e9c348e4790a5116c22992a40eeee8b8ab0033" }
+# The view/UI layer. Pinned to the revision with the dialog backend and
+# `{exe}` config expansion.
+r-modals = { git = "https://github.com/Kevin-Ramirez127/r-modals", rev = "c4aa9fff057a4699083ed0761689592d97783773" }
 
 # Ship a small, fast binary: `strip` + LTO + `panic = "abort"` cut the size
 # substantially, and every dialog is a short-lived child process, so a smaller
