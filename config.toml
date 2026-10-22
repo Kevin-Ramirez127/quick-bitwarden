@@ -37,6 +37,16 @@ prefix = ">show items"
 shell = "{exe} show-items"
 hint = "Show the full item list"
 
+[[prefix]]
+prefix = ">restart"
+shell = "{exe} restart"
+hint = "Restart the daemon"
+
+[[prefix]]
+prefix = ">stop"
+shell = "{exe} stop"
+hint = "Stop the daemon"
+
 # --- Shortcuts --------------------------------------------------------------
 
 [[shortcut]]

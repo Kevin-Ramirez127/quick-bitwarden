@@ -254,7 +254,17 @@ mod tests {
         // One file: the prefix parser ignores `[[shortcut]]`, and vice versa.
         let prefixes = r_modals::parse_prefixes(&content).expect("prefixes parse");
         let names: Vec<&str> = prefixes.iter().map(|s| s.prefix.as_str()).collect();
-        assert_eq!(names, [">sync", ">lock", ">hide items", ">show items"]);
+        assert_eq!(
+            names,
+            [
+                ">sync",
+                ">lock",
+                ">hide items",
+                ">show items",
+                ">restart",
+                ">stop"
+            ]
+        );
         assert!(prefixes.iter().all(|s| s
             .shell
             .as_deref()
@@ -297,6 +307,8 @@ mod tests {
         assert!(prefixes.contains(&">lock".to_string()));
         assert!(prefixes.contains(&">hide items".to_string()));
         assert!(prefixes.contains(&">show items".to_string()));
+        assert!(prefixes.contains(&">restart".to_string()));
+        assert!(prefixes.contains(&">stop".to_string()));
 
         let shortcuts: Vec<String> = r_modals::parse_shortcuts(&content)
             .unwrap()
@@ -315,7 +327,7 @@ mod tests {
         write_default_config(&paths);
 
         let content = std::fs::read_to_string(paths.config()).unwrap();
-        assert_eq!(r_modals::parse_prefixes(&content).unwrap().len(), 4);
+        assert_eq!(r_modals::parse_prefixes(&content).unwrap().len(), 6);
         assert_eq!(r_modals::parse_shortcuts(&content).unwrap().len(), 1);
         assert!(!content.contains("{exe}"));
         assert!(!content.contains("{qbw}"));

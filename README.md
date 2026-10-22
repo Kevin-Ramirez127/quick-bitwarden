@@ -97,6 +97,8 @@ Queries that start with `>` are commands, not item names (defined in
 - `>lock` — lock the vault and forget the cached session.
 - `>hide items` — hide the item list until you search for 3+ characters.
 - `>show items` — show the full item list again.
+- `>restart` — restart the daemon.
+- `>stop` — stop the daemon (keeps the session in `/tmp/qbw/s`).
 
 #### Shortcuts
 
