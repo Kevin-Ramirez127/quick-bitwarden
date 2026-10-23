@@ -3,7 +3,8 @@
 //! `show`/`stop` commands delivered over the control FIFO.
 
 use std::io::{BufRead, BufReader};
-use std::sync::OnceLock;
+use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::clipboard;
 use crate::paths::Paths;
@@ -11,14 +12,15 @@ use crate::proc::{self, read_pid_file, send_signal};
 use crate::ui;
 use crate::vault::{self, State};
 
-/// Set after the FIFO exists so the signal handler can clean up.
-static CLEANUP_PATHS: OnceLock<Paths> = OnceLock::new();
+/// Set by the signal handler, consumed by the daemon loop.
+///
+/// A handler may only do async-signal-safe work; `AtomicBool::store` is, while
+/// removing files or allocating is not. The loop notices the flag, breaks and
+/// runs the normal cleanup path.
+static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_sig: libc::c_int) {
-    if let Some(paths) = CLEANUP_PATHS.get() {
-        paths.remove_runtime_files();
-    }
-    unsafe { libc::_exit(0) };
+    STOP.store(true, Ordering::SeqCst);
 }
 
 /// `--daemon`: run until `stop` or a termination signal.
@@ -62,10 +64,10 @@ pub fn run_daemon(paths: &Paths) {
         crate::die("could not create control fifo");
     }
 
-    let _ = CLEANUP_PATHS.set(paths.clone());
     unsafe {
-        libc::signal(libc::SIGTERM, on_signal as *const () as usize);
-        libc::signal(libc::SIGINT, on_signal as *const () as usize);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, on_signal as *const () as usize);
+        }
     }
 
     // `exec 3<>"$CTL"`: open read+write so the FIFO never reports EOF.
@@ -89,6 +91,40 @@ pub fn run_daemon(paths: &Paths) {
     let mut refresh: Option<vault::BackgroundRefresh> = None;
 
     loop {
+        if STOP.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // The FIFO is opened read+write so it never reports EOF; a blocking
+        // `read_line` would sit here forever and a signal handler could only
+        // abort the process (doing non-async-signal-safe cleanup from the
+        // handler). Poll with a timeout instead and unwind normally.
+        let mut pfd = libc::pollfd {
+            fd: reader.get_ref().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 200) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+            continue;
+        }
+        if STOP.load(Ordering::SeqCst) {
+            break;
+        }
+        let readable = pfd.revents & libc::POLLIN != 0;
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0
+            && !readable
+            && reader.buffer().is_empty()
+        {
+            break;
+        }
+        if !readable && reader.buffer().is_empty() {
+            continue; // timeout: no command yet
+        }
+
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
