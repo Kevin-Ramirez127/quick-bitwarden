@@ -220,21 +220,26 @@ pub fn cmd_lock(paths: &Paths) {
 }
 
 /// `stop`: ask the daemon to exit, forcing it after a grace period.
+///
+/// Stopping forgets the cached session; use `hide` to keep the daemon (and its
+/// session) running.
 pub fn cmd_stop(paths: &Paths) {
     require_private_dir(paths);
     if !daemon_alive(paths) {
         cleanup_stale(paths);
+        paths.remove_session();
         println!("quick-bitwarden: not running");
         return;
     }
-    stop_daemon(paths);
+    stop_daemon(paths, false);
 }
 
 /// `restart`: cycle the daemon, starting it when it is not running.
 pub fn cmd_restart(paths: &Paths) {
     require_private_dir(paths);
     if daemon_alive(paths) {
-        stop_daemon(paths);
+        // A restart keeps the session: the new daemon reloads `$BASE/s`.
+        stop_daemon(paths, true);
     } else {
         cleanup_stale(paths);
     }
@@ -242,7 +247,7 @@ pub fn cmd_restart(paths: &Paths) {
 }
 
 /// `stop_daemon`: end a live daemon (FIFO `stop`, then signals) and clean up.
-fn stop_daemon(paths: &Paths) {
+fn stop_daemon(paths: &Paths, keep_session: bool) {
     if is_fifo(&paths.ctl) {
         if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&paths.ctl) {
             let _ = f.write_all(b"stop\n");
@@ -269,6 +274,11 @@ fn stop_daemon(paths: &Paths) {
     }
 
     cleanup_stale(paths);
+    if !keep_session {
+        // The daemon cannot clean up after SIGKILL, and `stop` is an explicit
+        // "forget the session" request.
+        paths.remove_session();
+    }
 }
 
 /// `status`: report daemon pid and vault state.

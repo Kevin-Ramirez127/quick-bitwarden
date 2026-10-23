@@ -154,6 +154,9 @@ pub fn run_daemon(paths: &Paths) {
         }
     }
 
+    // Never leave the session token in memory on the way out. The file is kept
+    // for `restart`; `stop` removes it explicitly once the daemon is gone.
+    vault::forget_session(&mut state);
     paths.remove_runtime_files();
 }
 
@@ -306,8 +309,8 @@ fn do_lock(state: &mut State, paths: &Paths) {
         ui::error_dialog(paths, "Could not lock the vault");
         return;
     }
-    let _ = std::fs::remove_file(&paths.session);
-    state.session = None;
+    paths.remove_session();
+    vault::forget_session(state);
     state.menu.clear();
     state.tsv.clear();
     state.last_refresh = 0;

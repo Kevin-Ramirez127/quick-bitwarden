@@ -2,7 +2,7 @@
 //! Runtime paths and tunables, mirroring the shell variables of the original.
 
 use std::fs::OpenOptions;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -153,6 +153,29 @@ impl Paths {
                 md.is_file() && md.uid() == unsafe { libc::geteuid() } && md.mode() & 0o022 == 0
             })
             .unwrap_or(false)
+    }
+
+    /// Persist the session token with mode `0600`, refusing a symlinked target.
+    ///
+    /// The runtime directory is already private, but writing the strongest
+    /// credential of the vault deserves its own check: a swapped symlink must
+    /// not turn this into "write the token wherever the attacker can read it".
+    pub fn write_session(&self, token: &str) -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.session)?;
+        // `mode` only applies when the file is created: repair a legacy mode.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(token.as_bytes())
+    }
+
+    /// Forget the stored session token (best effort).
+    pub fn remove_session(&self) {
+        let _ = std::fs::remove_file(&self.session);
     }
 }
 
@@ -345,6 +368,35 @@ mod tests {
         // Group-writable configs could be edited by another user.
         std::fs::set_permissions(paths.config(), std::fs::Permissions::from_mode(0o664)).unwrap();
         assert!(!paths.config_is_trusted());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn session_token_is_private_and_never_follows_a_symlink() {
+        let base = temp_base("session");
+        let paths = paths_in(&base);
+        paths.ensure_private_dir().unwrap();
+
+        paths.write_session("token-123").unwrap();
+        assert_eq!(
+            std::fs::metadata(&paths.session).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths.session).unwrap(),
+            "token-123"
+        );
+
+        paths.remove_session();
+        assert!(!paths.session.exists());
+
+        // A planted symlink must not become a token exfiltration channel.
+        let target = base.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &paths.session).unwrap();
+        assert!(paths.write_session("leak").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
 
         let _ = std::fs::remove_dir_all(&base);
     }

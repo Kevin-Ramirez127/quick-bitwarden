@@ -95,6 +95,13 @@ pub fn load_session(state: &mut State, paths: &Paths) {
     }
 }
 
+/// Forget the in-memory session token and wipe its buffer.
+pub fn forget_session(state: &mut State) {
+    if let Some(mut token) = state.session.take() {
+        wipe_string(&mut token);
+    }
+}
+
 /// Outcome of a cache load that never prompts.
 pub enum Load {
     /// The vault is unlocked and the in-memory cache is populated.
@@ -193,7 +200,7 @@ pub fn prompt_and_unlock(state: &mut State, paths: &Paths) -> bool {
     wipe_string(&mut password);
     match token {
         Some(token) => {
-            let _ = std::fs::write(&paths.session, token.as_bytes());
+            let _ = paths.write_session(&token);
             state.session = Some(token);
             state.unlocked = Some(true);
             true

@@ -72,7 +72,7 @@ quick-bitwarden sync     # run `bw sync` and refresh the daemon cache
 quick-bitwarden lock     # lock the vault and forget the cached session
 quick-bitwarden hide-items  # hide the item list until a 3+ character search
 quick-bitwarden show-items  # show the full item list again
-quick-bitwarden stop     # stop the daemon (keeps the session in /tmp/qbw/s)
+quick-bitwarden stop     # stop the daemon and forget the cached session
 quick-bitwarden restart  # restart the daemon (starts it if not running)
 quick-bitwarden status   # daemon and vault status
 quick-bitwarden status --toggle  # whether the picker is shown or hidden
@@ -100,7 +100,7 @@ Queries that start with `>` are commands, not item names (defined in
 - `>hide items` — hide the item list until you search for 3+ characters.
 - `>show items` — show the full item list again.
 - `>restart` — restart the daemon.
-- `>stop` — stop the daemon (keeps the session in `/tmp/qbw/s`).
+- `>stop` — stop the daemon and forget the cached session.
 
 #### Shortcuts
 
@@ -174,8 +174,9 @@ The next `show` asks for the master password again. The daemon keeps running.
 
 ## Security
 
-- The master password is never stored; the session token lives in
-  `$QBW_BASE/s` and expires when the machine shuts down.
+- The master password is never stored. The session token lives in a `0600`
+  file inside the private runtime directory (`$QBW_BASE/s`) and is removed by
+  `lock` and `stop`; `restart` keeps it so the daemon comes back unlocked.
 - Vault passwords are never cached by the daemon or written to disk: each pick
   asks `bw` for the selected field, so locking the vault elsewhere stops
   further copies immediately.
