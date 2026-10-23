@@ -3,22 +3,24 @@
 //! `show`/`stop` commands delivered over the control FIFO.
 
 use std::io::{BufRead, BufReader};
-use std::sync::OnceLock;
+use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::clipboard;
 use crate::paths::Paths;
-use crate::proc::{self, read_pid, send_signal};
+use crate::proc::{self, read_pid_file, send_signal};
 use crate::ui;
 use crate::vault::{self, State};
 
-/// Set after the FIFO exists so the signal handler can clean up.
-static CLEANUP_PATHS: OnceLock<Paths> = OnceLock::new();
+/// Set by the signal handler, consumed by the daemon loop.
+///
+/// A handler may only do async-signal-safe work; `AtomicBool::store` is, while
+/// removing files or allocating is not. The loop notices the flag, breaks and
+/// runs the normal cleanup path.
+static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_sig: libc::c_int) {
-    if let Some(paths) = CLEANUP_PATHS.get() {
-        paths.remove_runtime_files();
-    }
-    unsafe { libc::_exit(0) };
+    STOP.store(true, Ordering::SeqCst);
 }
 
 /// `--daemon`: run until `stop` or a termination signal.
@@ -27,7 +29,12 @@ pub fn run_daemon(paths: &Paths) {
         crate::die("missing dependency: bw");
     }
 
-    let _ = std::fs::create_dir_all(&paths.base);
+    if let Err(e) = paths.ensure_private_dir() {
+        crate::die(&format!(
+            "unsafe runtime directory {}: {e}",
+            paths.base.display()
+        ));
+    }
 
     // Single instance: only the process that owns this lock may be the daemon.
     // A losing `--daemon` exits quietly; `flock` is released by the kernel when
@@ -47,7 +54,9 @@ pub fn run_daemon(paths: &Paths) {
     let mut busy = false;
     proc::write_menu_state(&paths.menu_state(), generation, busy);
 
-    let _ = std::fs::write(&paths.pid, format!("{}\n", std::process::id()));
+    if let Some(pid) = proc::Pid::current() {
+        let _ = proc::write_pid_file(&paths.pid, pid);
+    }
 
     let _ = std::fs::remove_file(&paths.ctl);
     let ctl = proc::cstr(&paths.ctl);
@@ -55,10 +64,10 @@ pub fn run_daemon(paths: &Paths) {
         crate::die("could not create control fifo");
     }
 
-    let _ = CLEANUP_PATHS.set(paths.clone());
     unsafe {
-        libc::signal(libc::SIGTERM, on_signal as *const () as usize);
-        libc::signal(libc::SIGINT, on_signal as *const () as usize);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, on_signal as *const () as usize);
+        }
     }
 
     // `exec 3<>"$CTL"`: open read+write so the FIFO never reports EOF.
@@ -82,6 +91,40 @@ pub fn run_daemon(paths: &Paths) {
     let mut refresh: Option<vault::BackgroundRefresh> = None;
 
     loop {
+        if STOP.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // The FIFO is opened read+write so it never reports EOF; a blocking
+        // `read_line` would sit here forever and a signal handler could only
+        // abort the process (doing non-async-signal-safe cleanup from the
+        // handler). Poll with a timeout instead and unwind normally.
+        let mut pfd = libc::pollfd {
+            fd: reader.get_ref().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 200) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+            continue;
+        }
+        if STOP.load(Ordering::SeqCst) {
+            break;
+        }
+        let readable = pfd.revents & libc::POLLIN != 0;
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0
+            && !readable
+            && reader.buffer().is_empty()
+        {
+            break;
+        }
+        if !readable && reader.buffer().is_empty() {
+            continue; // timeout: no command yet
+        }
+
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
@@ -149,6 +192,9 @@ pub fn run_daemon(paths: &Paths) {
         }
     }
 
+    // Never leave the session token in memory on the way out. The file is kept
+    // for `restart`; `stop` removes it explicitly once the daemon is gone.
+    vault::forget_session(&mut state);
     paths.remove_runtime_files();
 }
 
@@ -229,51 +275,34 @@ fn do_show(state: &mut State, paths: &Paths) {
         return;
     }
 
-    // The picker's option id is the short label, so the hidden-list exact-name
-    // path still works. Resolve the corresponding Bitwarden id from `tsv`,
-    // preferring the exact displayed label so duplicate names stay unambiguous.
-    let id = state
-        .tsv
-        .iter()
-        .find(|(name, _)| name == &label)
-        .map(|(_, id)| id.clone())
-        .or_else(|| {
-            state
-                .tsv
-                .iter()
-                .find(|(name, _)| short_label(name) == picked.id)
-                .map(|(_, id)| id.clone())
-        });
+    // Resolve the real Bitwarden id from the row the user picked. The picker
+    // reports the option index (stable across filtering) and the option id is
+    // the short label, which is not unique: two items can display the same
+    // `Name  (user)`. Trusting the label would copy the first match's secret
+    // when the user picked a later duplicate, so use the index.
+    let id = resolve_pick(&state.tsv, &picked).map(|(_, id)| id.clone());
 
-    let mut value = id
-        .as_ref()
-        .and_then(|id| {
-            if copy_username {
-                state.user.get(id)
-            } else {
-                state.pass.get(id)
-            }
-        })
-        .cloned()
-        .unwrap_or_default();
-
-    if value.is_empty() {
-        let lookup = id.clone().unwrap_or_else(|| label.clone());
-        value = if copy_username {
-            vault::bw_get_username(state.session.as_deref(), &lookup).unwrap_or_default()
-        } else {
-            vault::bw_get_password(state.session.as_deref(), &lookup).unwrap_or_default()
-        };
-        if value.is_empty() {
-            let what = if copy_username {
-                "username"
-            } else {
-                "password"
+    let field = if copy_username {
+        "username"
+    } else {
+        "password"
+    };
+    let lookup = id.as_deref().unwrap_or(label.as_str());
+    let value = match fetch_field(state, paths, field, lookup) {
+        Ok(value) => value,
+        Err(e) => {
+            let why = match e {
+                FetchError::Locked => "the vault is locked",
+                FetchError::Unauthenticated => "not logged in, run 'bw login'",
+                FetchError::Failed => "could not read the vault",
             };
-            ui::error_dialog(paths, &format!("Could not fetch {what} for '{label}'"));
+            ui::error_dialog(
+                paths,
+                &format!("Could not fetch {field} for '{label}': {why}"),
+            );
             return;
         }
-    }
+    };
 
     if !clipboard::copy_password(&value) {
         ui::error_dialog(paths, "Clipboard tool missing (wl-copy, xclip or xsel)");
@@ -284,7 +313,9 @@ fn do_show(state: &mut State, paths: &Paths) {
         let copied = value.clone();
         std::thread::spawn(move || clipboard::remove_from_history(&copied));
     }
-    {
+    if !clipboard::schedule_clear(paths.clear_after) {
+        // Last resort when re-exec fails (e.g. the binary was deleted):
+        // a thread at least clears while this daemon stays alive.
         let clear_after = paths.clear_after;
         std::thread::spawn(move || clipboard::clear_password(clear_after));
     }
@@ -318,20 +349,57 @@ fn do_lock(state: &mut State, paths: &Paths) {
         ui::error_dialog(paths, "Could not lock the vault");
         return;
     }
-    let _ = std::fs::remove_file(&paths.session);
-    state.session = None;
+    paths.remove_session();
+    vault::forget_session(state);
     state.menu.clear();
     state.tsv.clear();
-    state.pass.clear();
-    state.user.clear();
     state.last_refresh = 0;
     state.unlocked = Some(false);
     ui::notify("Vault locked");
 }
 
+/// Why a per-pick `bw get` failed, so the caller can show a useful message.
+enum FetchError {
+    Locked,
+    Unauthenticated,
+    Failed,
+}
+
+/// Read one field straight from the vault.
+///
+/// The daemon deliberately keeps no decrypted secrets between picks, so this is
+/// the point where a vault lock (from `bw` or any other client) takes effect. A
+/// stale session is retried once after the master-password dialog.
+fn fetch_field(
+    state: &mut State,
+    paths: &Paths,
+    field: &str,
+    lookup: &str,
+) -> Result<String, FetchError> {
+    if let Some(value) = vault::bw_get_field(state.session.as_deref(), field, lookup) {
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+
+    match vault::bw_status(state.session.as_deref()).as_str() {
+        "locked" => {
+            if !vault::prompt_and_unlock(state, paths) {
+                return Err(FetchError::Locked);
+            }
+            match vault::bw_get_field(state.session.as_deref(), field, lookup) {
+                Some(value) if !value.is_empty() => Ok(value),
+                _ => Err(FetchError::Failed),
+            }
+        }
+        "unauthenticated" => Err(FetchError::Unauthenticated),
+        _ => Err(FetchError::Failed),
+    }
+}
+
 /// `cleanup_stale`: drop any leftover picker and runtime files.
 pub fn cleanup_stale(paths: &Paths) {
-    if let Some(pid) = read_pid(&paths.menu_pid) {
+    if let Some(pid) = read_pid_file(&paths.menu_pid) {
         send_signal(pid, libc::SIGTERM);
     }
     paths.remove_runtime_files();
@@ -345,9 +413,40 @@ fn short_label(selection: &str) -> String {
     }
 }
 
+/// Map a picker selection back to the `(label, id)` row the user chose.
+///
+/// `ModalSelection::index` is the index into the option list as sent, even when
+/// the visible list is filtered, so it identifies the row unambiguously. The
+/// option id is the short label (needed by the hidden-list exact-name search)
+/// and therefore not unique. Custom input (a name that matched no row) has no
+/// row: the caller falls back to `bw get <typed text>`.
+fn resolve_pick<'a>(
+    tsv: &'a [(String, String)],
+    sel: &r_modals::ModalSelection,
+) -> Option<&'a (String, String)> {
+    if sel.custom_input {
+        return None;
+    }
+    let row = tsv.get(sel.index)?;
+    (short_label(&row.0) == sel.id).then_some(row)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::short_label;
+    use super::{resolve_pick, short_label};
+    use r_modals::ModalSelection;
+
+    fn selection(index: usize, id: &str, label: &str, custom_input: bool) -> ModalSelection {
+        ModalSelection {
+            id: id.to_string(),
+            label: label.to_string(),
+            index,
+            path: vec![index],
+            query: label.to_string(),
+            custom_input,
+            shortcut: None,
+        }
+    }
 
     #[test]
     fn short_label_matches_bash_parameter_expansion() {
@@ -356,5 +455,33 @@ mod tests {
         // `${s%%  (*}` cuts at the first `  (`.
         assert_eq!(short_label("A  (b)  (c)"), "A");
         assert_eq!(short_label(""), "");
+    }
+
+    #[test]
+    fn resolve_pick_uses_the_row_index_not_the_shared_label() {
+        let tsv = vec![
+            ("GitHub  (octocat)".to_string(), "id-a".to_string()),
+            ("GitHub  (octocat)".to_string(), "id-b".to_string()),
+        ];
+
+        // Two rows share the same label/id; the index picks the exact one.
+        let first = selection(0, "GitHub", "GitHub  (octocat)", false);
+        assert_eq!(
+            resolve_pick(&tsv, &first).map(|(_, id)| id.as_str()),
+            Some("id-a")
+        );
+        let second = selection(1, "GitHub", "GitHub  (octocat)", false);
+        assert_eq!(
+            resolve_pick(&tsv, &second).map(|(_, id)| id.as_str()),
+            Some("id-b")
+        );
+
+        // A mismatched pair is not trusted: the caller falls back to `bw get`.
+        let tampered = selection(1, "Other", "Other", false);
+        assert!(resolve_pick(&tsv, &tampered).is_none());
+
+        // Free-typed input has no row at all.
+        let typed = selection(0, "GitHub", "GitHub", true);
+        assert!(resolve_pick(&tsv, &typed).is_none());
     }
 }

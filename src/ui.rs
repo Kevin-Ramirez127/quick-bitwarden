@@ -5,12 +5,14 @@
 //! child process (`--menu`, `--ask`, `--error`) so it can be killed from the
 //! outside, which keeps `hide` and `toggle` working.
 
+use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
 use std::process::Command;
 
 use r_modals::{ConfigFile, Dialog, DialogOutput, DialogSession};
 
 use crate::paths::Paths;
-use crate::proc::command_exists;
+use crate::proc::{self, command_exists};
 
 /// Shown in the picker window until `bw list items` has produced a menu.
 const LOADING_MESSAGE: &str = "Loading your data from bw…";
@@ -27,11 +29,72 @@ fn short_label(selection: &str) -> String {
 // Parent side: spawn the child dialogs and collect their result.
 // ---------------------------------------------------------------------------
 
+/// A running dialog child plus its pid file.
+///
+/// The pid file is written here (with the child's start time, so a reused pid
+/// cannot be mistaken for the picker) and removed when the session is dropped,
+/// including on every early-return path.
+pub struct MenuSession {
+    inner: Option<DialogSession>,
+    _pid_guard: MenuPidGuard,
+}
+
+impl MenuSession {
+    /// Wait for the child and collect its result.
+    pub fn wait(mut self) -> Result<DialogOutput, r_modals::ModalError> {
+        let session = self
+            .inner
+            .take()
+            .expect("MenuSession::wait must not be called twice");
+        session.wait()
+    }
+
+    /// Close the child without waiting for a selection (success/failure paths).
+    pub fn cancel(mut self) -> std::io::Result<()> {
+        let session = self
+            .inner
+            .take()
+            .expect("MenuSession::cancel must not be called twice");
+        session.cancel()
+    }
+}
+
+impl Deref for MenuSession {
+    type Target = DialogSession;
+
+    fn deref(&self) -> &DialogSession {
+        self.inner.as_ref().expect("menu session already waited")
+    }
+}
+
+impl DerefMut for MenuSession {
+    fn deref_mut(&mut self) -> &mut DialogSession {
+        self.inner.as_mut().expect("menu session already waited")
+    }
+}
+
+struct MenuPidGuard {
+    path: PathBuf,
+}
+
+impl Drop for MenuPidGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Record the dialog pid so `hide`/`toggle` can close it from another process.
+fn track_menu_child(paths: &Paths, session: &DialogSession) {
+    if let Some(pid) = proc::Pid::of(session.pid() as i32) {
+        let _ = proc::write_pid_file(&paths.menu_pid, pid);
+    }
+}
+
 /// Open the picker window without waiting for vault data.
 ///
 /// The window starts in its loading state; [`fill_menu`] delivers the items and
 /// closes stdin, then [`DialogSession::wait`] collects the typed selection.
-pub fn start_menu(paths: &Paths) -> Option<DialogSession> {
+pub fn start_menu(paths: &Paths) -> Option<MenuSession> {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => {
@@ -43,7 +106,6 @@ pub fn start_menu(paths: &Paths) -> Option<DialogSession> {
     let mut dialog = Dialog::menu()
         .program(exe)
         .app_id("quick-bitwarden")
-        .pid_file(paths.menu_pid.clone())
         .placeholder("Search")
         .loading_message(LOADING_MESSAGE)
         .allow_custom_input(true)
@@ -60,17 +122,34 @@ pub fn start_menu(paths: &Paths) -> Option<DialogSession> {
     }
 
     // `$BASE/config.toml` holds both the `>…` query prefixes (e.g. `>s` → sync)
-    // and the keyboard shortcuts (e.g. Shift+Enter → copy the username).
+    // and the keyboard shortcuts (e.g. Shift+Enter → copy the username). Since
+    // those entries can run shell commands, never load a file another user
+    // could have written.
     let config = paths.config();
     if config.is_file() {
-        dialog = dialog.config_file(config);
+        if paths.config_is_trusted() {
+            dialog = dialog.config_file(config);
+        } else {
+            error_dialog(
+                paths,
+                "Refusing to load config.toml: it is not owned by you or is writable by another user.",
+            );
+        }
     }
 
     // Truncate up front so an interrupted run cannot leave a stale selection.
     let _ = std::fs::write(&paths.sel, b"");
 
     match dialog.start() {
-        Ok(session) => Some(session),
+        Ok(session) => {
+            track_menu_child(paths, &session);
+            Some(MenuSession {
+                inner: Some(session),
+                _pid_guard: MenuPidGuard {
+                    path: paths.menu_pid.clone(),
+                },
+            })
+        }
         Err(e) => {
             error_dialog(paths, &format!("Could not open the search window: {e}"));
             None
@@ -109,14 +188,18 @@ pub fn show_menu(paths: &Paths, tsv: &[(String, String)]) -> Option<DialogOutput
 /// cancelled / unavailable.
 pub fn ask_password(paths: &Paths, label: &str) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
-    let output = Dialog::ask(label)
+    let session = Dialog::ask(label)
         .program(exe)
         .app_id("quick-bitwarden")
         .placeholder(label)
         .password(true)
-        .pid_file(paths.menu_pid.clone())
-        .run()
+        .start()
         .ok()?;
+    track_menu_child(paths, &session);
+    let _pid_guard = MenuPidGuard {
+        path: paths.menu_pid.clone(),
+    };
+    let output = session.wait().ok()?;
     match output {
         DialogOutput::Text(pw) if !pw.is_empty() => Some(pw),
         _ => None,

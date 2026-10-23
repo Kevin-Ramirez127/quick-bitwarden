@@ -14,13 +14,15 @@ background daemon.
 It uses Bitwarden CLI `bw` to get your passwords, and shows them in an r-modals
 window so you can select one and just copy it.
 
-quick-bitwarden starts the daemon and stores the data in memory so toggling the
-window is instant.
+quick-bitwarden starts the daemon and stores the item list in memory so toggling
+the window is instant. Passwords are read from `bw` only when you pick an item,
+so a vault locked outside q-bw (for example with `bw lock`) is enforced
+immediately.
 
 Every time the window is hidden, it refreshes the cache only if more than
 `QBW_REFRESH_INTERVAL` seconds elapsed (30 by default).
 
-On **Enter** it copies the password to the clipboard (from memory, no wait) and
+On **Enter** it fetches the password from `bw`, copies it to the clipboard and
 in the background **deletes that password** from `cliphist` immediately, so the
 clipboard history never keeps it; the password stays on the current clipboard
 for `QBW_CLEAR_AFTER` seconds and then is cleared.
@@ -70,7 +72,7 @@ quick-bitwarden sync     # run `bw sync` and refresh the daemon cache
 quick-bitwarden lock     # lock the vault and forget the cached session
 quick-bitwarden hide-items  # hide the item list until a 3+ character search
 quick-bitwarden show-items  # show the full item list again
-quick-bitwarden stop     # stop the daemon (keeps the session in /tmp/qbw/s)
+quick-bitwarden stop     # stop the daemon and forget the cached session
 quick-bitwarden restart  # restart the daemon (starts it if not running)
 quick-bitwarden status   # daemon and vault status
 quick-bitwarden status --toggle  # whether the picker is shown or hidden
@@ -98,7 +100,7 @@ Queries that start with `>` are commands, not item names (defined in
 - `>hide items` — hide the item list until you search for 3+ characters.
 - `>show items` — show the full item list again.
 - `>restart` — restart the daemon.
-- `>stop` — stop the daemon (keeps the session in `/tmp/qbw/s`).
+- `>stop` — stop the daemon and forget the cached session.
 
 #### Shortcuts
 
@@ -134,6 +136,11 @@ is meaningful.
   `stop`/`restart` (and the daemon does not need to be restarted to pick it
   up). `>show items` removes it.
 
+This is a shoulder-surfing aid, not an access-control boundary: the labels are
+still sent to the picker process (which runs as you), and typing an item's name
+exactly reveals it. It does not change what `bw` will return, and it does not
+protect against someone who can already run commands as your user.
+
 On tiling compositors (sway/Hyprland), float the window via its app id:
 
 ```
@@ -166,18 +173,25 @@ The next `show` asks for the master password again. The daemon keeps running.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `QBW_BASE` | `/tmp/qbw` | Daemon working directory (session, IPC, pid) |
+| `QBW_BASE` | `$XDG_RUNTIME_DIR/qbw` (fallback `/tmp/qbw`) | Daemon working directory (session, IPC, pid). It must be a private (`0700`) directory owned by you; q-bw refuses to use one that is not. |
 | `QBW_CLEAR_AFTER` | `20` | Seconds the password stays on the clipboard |
 | `QBW_REFRESH_INTERVAL` | `30` | Seconds between vault cache refreshes |
 
 ## Security
 
-- The master password is never stored; the session token lives in
-  `$QBW_BASE/s` and expires when the machine shuts down.
-- Vault passwords live only in the daemon's memory, never written to disk.
+- The master password is never stored. The session token lives in a `0600`
+  file inside the private runtime directory (`$QBW_BASE/s`) and is removed by
+  `lock` and `stop`; `restart` keeps it so the daemon comes back unlocked.
+- Core dumps are disabled at startup (`RLIMIT_CORE=0`, inherited by `bw` and
+  the clipboard tools) and q-bw processes are not dumpable/ptraceable by other
+  same-user processes (`PR_SET_DUMPABLE=0`).
+- Vault passwords are never cached by the daemon or written to disk: each pick
+  asks `bw` for the selected field, so locking the vault elsewhere stops
+  further copies immediately.
 - On copy: the password is removed from `cliphist` right away (with retries in
   case the watcher writes late) and the current clipboard is cleared after
-  `QBW_CLEAR_AFTER` seconds (20 sec by default).
+  `QBW_CLEAR_AFTER` seconds (20 sec by default) by a detached helper, so
+  `stop`/`restart` or a daemon crash does not leave it on the clipboard.
 
 ## Troubleshooting
 

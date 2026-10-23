@@ -1,0 +1,18 @@
+[advisories]
+# rkyv 0.7.46 is a transitive dependency:
+#
+#   quick-bitwarden -> r-modals -> lightningcss -> parcel_sourcemap -> rkyv
+#
+# RUSTSEC-2026-0235 covers insufficient validation when deserializing an
+# rkyv archive containing `Rc`/`Arc`. The only such deserialization is
+# `parcel_sourcemap::SourceMap::from_buffer`, and nothing in the dependency
+# graph calls it: lightningcss reads inline source maps only through
+# `from_data_url` (which requires `application/json` and takes the JSON
+# path), and r-modals does not use source maps at all. The vulnerable code
+# is compiled in but never reached with attacker-controlled bytes.
+#
+# lightningcss 1.0.0-alpha.72 and parcel_sourcemap 2.1.1 are the latest
+# releases and both still require rkyv 0.7; rkyv 0.8 is API-incompatible, so
+# there is no compatible upgrade yet. Remove this ignore once
+# parcel_sourcemap supports rkyv >= 0.8.17.
+ignore = ["RUSTSEC-2026-0235"]
