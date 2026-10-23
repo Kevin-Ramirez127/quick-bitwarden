@@ -2,7 +2,6 @@
 //! Thin client commands: start/steer the daemon and manage the open picker.
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -10,6 +9,19 @@ use crate::daemon::cleanup_stale;
 use crate::paths::Paths;
 use crate::proc::{self, command_exists, is_fifo, pid_alive, read_pid, send_signal};
 use crate::{ui, vault};
+
+/// Refuse to touch a runtime directory another user could have planted.
+///
+/// A missing directory is fine: the client will start the daemon (which creates
+/// it) or simply report that it is not running.
+fn require_private_dir(paths: &Paths) {
+    if let Err(e) = paths.validate_private_dir() {
+        crate::die(&format!(
+            "unsafe runtime directory {}: {e}",
+            paths.base.display()
+        ));
+    }
+}
 
 /// `daemon_alive`: pid file points at a live process.
 pub fn daemon_alive(paths: &Paths) -> bool {
@@ -45,7 +57,12 @@ fn send_cmd(paths: &Paths, cmd: &str) {
 
 /// `ensure_daemon`: start the detached daemon and wait for it to be ready.
 pub fn ensure_daemon(paths: &Paths) {
-    let _ = std::fs::create_dir_all(&paths.base);
+    if let Err(e) = paths.ensure_private_dir() {
+        crate::die(&format!(
+            "unsafe runtime directory {}: {e}",
+            paths.base.display()
+        ));
+    }
 
     // Serialise startup across concurrent invocations. Without this, two
     // launchers can both see no daemon and spawn one each (two daemons, two
@@ -57,7 +74,6 @@ pub fn ensure_daemon(paths: &Paths) {
         return;
     }
 
-    let _ = std::fs::set_permissions(&paths.base, std::fs::Permissions::from_mode(0o700));
     cleanup_stale(paths);
 
     let exe =
@@ -116,6 +132,7 @@ fn request_show(paths: &Paths) {
 
 /// `toggle`: close the picker if open, otherwise open it.
 pub fn cmd_toggle(paths: &Paths) {
+    require_private_dir(paths);
     if menu_open(paths) {
         kill_menu(paths);
         return;
@@ -132,6 +149,7 @@ pub fn cmd_show(paths: &Paths) {
 
 /// `hide`: close the picker, keeping the daemon alive.
 pub fn cmd_hide(paths: &Paths) {
+    require_private_dir(paths);
     kill_menu(paths);
 }
 
@@ -150,7 +168,12 @@ pub fn cmd_show_items(paths: &Paths) {
 fn set_items_hidden(paths: &Paths, hidden: bool) {
     // The picker child reads the marker itself, so a running daemon picks the
     // change up on the next `show` without a round-trip.
-    let _ = std::fs::create_dir_all(&paths.base);
+    if let Err(e) = paths.ensure_private_dir() {
+        crate::die(&format!(
+            "unsafe runtime directory {}: {e}",
+            paths.base.display()
+        ));
+    }
     if paths.set_items_hidden(hidden).is_err() {
         crate::die("could not save the items setting");
     }
@@ -174,6 +197,7 @@ pub fn cmd_sync(paths: &Paths) {
 /// The daemon owns both the session token and the cache, so it does the work
 /// when it is running; otherwise this process can lock `bw` directly.
 pub fn cmd_lock(paths: &Paths) {
+    require_private_dir(paths);
     if daemon_alive(paths) {
         // Close the picker first: the daemon may be blocked serving it, and
         // a stale window must not keep offering items after the lock.
@@ -197,6 +221,7 @@ pub fn cmd_lock(paths: &Paths) {
 
 /// `stop`: ask the daemon to exit, forcing it after a grace period.
 pub fn cmd_stop(paths: &Paths) {
+    require_private_dir(paths);
     if !daemon_alive(paths) {
         cleanup_stale(paths);
         println!("quick-bitwarden: not running");
@@ -207,6 +232,7 @@ pub fn cmd_stop(paths: &Paths) {
 
 /// `restart`: cycle the daemon, starting it when it is not running.
 pub fn cmd_restart(paths: &Paths) {
+    require_private_dir(paths);
     if daemon_alive(paths) {
         stop_daemon(paths);
     } else {
@@ -247,6 +273,7 @@ fn stop_daemon(paths: &Paths) {
 
 /// `status`: report daemon pid and vault state.
 pub fn cmd_status(paths: &Paths) {
+    require_private_dir(paths);
     if !daemon_alive(paths) {
         println!("quick-bitwarden: daemon not running");
         return;
@@ -271,6 +298,7 @@ pub fn cmd_status(paths: &Paths) {
 
 /// `status --toggle`: report whether the picker is shown or hidden.
 pub fn cmd_status_toggle(paths: &Paths) {
+    require_private_dir(paths);
     println!("quick-bitwarden: {}", toggle_state(paths));
 }
 

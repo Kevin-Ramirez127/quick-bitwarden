@@ -42,7 +42,7 @@ fn usage() {
          \x20 -v, --version  Print version and exit\n\
          \n\
          Environment:\n\
-         \x20 QBW_BASE              Runtime directory (default: /tmp/qbw)\n\
+         \x20 QBW_BASE              Runtime directory (default: $XDG_RUNTIME_DIR/qbw, fallback /tmp/qbw)\n\
          \x20 QBW_REFRESH_INTERVAL  Cache refresh interval in seconds (default: 30)\n"
     );
 }

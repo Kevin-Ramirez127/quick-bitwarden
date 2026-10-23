@@ -27,7 +27,12 @@ pub fn run_daemon(paths: &Paths) {
         crate::die("missing dependency: bw");
     }
 
-    let _ = std::fs::create_dir_all(&paths.base);
+    if let Err(e) = paths.ensure_private_dir() {
+        crate::die(&format!(
+            "unsafe runtime directory {}: {e}",
+            paths.base.display()
+        ));
+    }
 
     // Single instance: only the process that owns this lock may be the daemon.
     // A losing `--daemon` exits quietly; `flock` is released by the kernel when

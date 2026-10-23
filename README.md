@@ -166,7 +166,7 @@ The next `show` asks for the master password again. The daemon keeps running.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `QBW_BASE` | `/tmp/qbw` | Daemon working directory (session, IPC, pid) |
+| `QBW_BASE` | `$XDG_RUNTIME_DIR/qbw` (fallback `/tmp/qbw`) | Daemon working directory (session, IPC, pid). It must be a private (`0700`) directory owned by you; q-bw refuses to use one that is not. |
 | `QBW_CLEAR_AFTER` | `20` | Seconds the password stays on the clipboard |
 | `QBW_REFRESH_INTERVAL` | `30` | Seconds between vault cache refreshes |
 

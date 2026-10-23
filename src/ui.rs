@@ -60,10 +60,19 @@ pub fn start_menu(paths: &Paths) -> Option<DialogSession> {
     }
 
     // `$BASE/config.toml` holds both the `>…` query prefixes (e.g. `>s` → sync)
-    // and the keyboard shortcuts (e.g. Shift+Enter → copy the username).
+    // and the keyboard shortcuts (e.g. Shift+Enter → copy the username). Since
+    // those entries can run shell commands, never load a file another user
+    // could have written.
     let config = paths.config();
     if config.is_file() {
-        dialog = dialog.config_file(config);
+        if paths.config_is_trusted() {
+            dialog = dialog.config_file(config);
+        } else {
+            error_dialog(
+                paths,
+                "Refusing to load config.toml: it is not owned by you or is writable by another user.",
+            );
+        }
     }
 
     // Truncate up front so an interrupted run cannot leave a stale selection.
