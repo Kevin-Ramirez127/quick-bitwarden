@@ -2,7 +2,7 @@
 //! Bitwarden CLI access: unlocking, the in-memory cache and password lookup.
 
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use serde::Deserialize;
@@ -181,7 +181,7 @@ pub fn prompt_and_unlock(state: &mut State, paths: &Paths) -> bool {
         _ => {}
     }
 
-    let password = match ui::ask_password(paths, "Master password") {
+    let mut password = match ui::ask_password(paths, "Master password") {
         Some(p) if !p.is_empty() => p,
         // Cancelled: remember the vault is locked so the background refresh
         // does not spend a `bw` call probing it again.
@@ -190,7 +190,10 @@ pub fn prompt_and_unlock(state: &mut State, paths: &Paths) -> bool {
             return false;
         }
     };
-    match bw_unlock(&password) {
+    let token = bw_unlock(&password);
+    // Do not leave the master password in freed heap memory (or a core dump).
+    wipe_string(&mut password);
+    match token {
         Some(token) => {
             let _ = std::fs::write(&paths.session, token.as_bytes());
             state.session = Some(token);
@@ -225,11 +228,13 @@ pub fn ensure_unlocked(state: &mut State, paths: &Paths) -> bool {
     }
 }
 
+/// `bw unlock --passwordenv … --raw`: return the session token.
+///
+/// The password is passed through the environment, never argv: a positional
+/// password is world-readable in `/proc/<pid>/cmdline` (and `ps`) for as long as
+/// `bw` runs.
 fn bw_unlock(password: &str) -> Option<String> {
-    let out = Command::new("bw")
-        .args(["unlock", password, "--raw"])
-        .output()
-        .ok()?;
+    let out = unlock_command(password).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -238,6 +243,30 @@ fn bw_unlock(password: &str) -> Option<String> {
             .trim_end_matches(['\n', '\r'])
             .to_string(),
     )
+}
+
+/// Name of the environment variable read by `bw unlock --passwordenv`.
+const PASSWORD_ENV: &str = "QBW_MASTER_PASSWORD";
+
+fn unlock_command(password: &str) -> Command {
+    let mut cmd = Command::new("bw");
+    cmd.args(["unlock", "--passwordenv", PASSWORD_ENV, "--raw"])
+        .env(PASSWORD_ENV, password)
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// Overwrite a secret string before dropping it.
+fn wipe_string(s: &mut String) {
+    // SAFETY: writing zeroes keeps the bytes valid for the buffer's capacity and
+    // nothing reads the string concurrently; `clear` then drops the logical
+    // contents. `write_volatile` keeps the wipe from being optimised away.
+    unsafe {
+        for byte in s.as_bytes_mut() {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    s.clear();
 }
 
 /// `bw sync`: pull the latest vault from the server. `true` on success.
@@ -464,7 +493,46 @@ fn bw_get(session: Option<&str>, field: &str, id_or_name: &str) -> Option<String
 
 #[cfg(test)]
 mod tests {
-    use super::parse_cache;
+    use super::{parse_cache, unlock_command, wipe_string, PASSWORD_ENV};
+
+    #[test]
+    fn unlock_passes_the_password_via_env_not_argv() {
+        let cmd = unlock_command("s3cret");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["unlock", "--passwordenv", PASSWORD_ENV, "--raw"]);
+        assert!(
+            !args.iter().any(|a| a.contains("s3cret")),
+            "the master password must never be an argument"
+        );
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs,
+            vec![(PASSWORD_ENV.to_string(), Some("s3cret".to_string()))]
+        );
+    }
+
+    #[test]
+    fn wipe_string_zeroes_the_buffer() {
+        let mut s = String::from("master-password");
+        let len = s.len();
+        wipe_string(&mut s);
+        assert!(s.is_empty());
+        // The first `len` bytes were initialised, then overwritten with zeroes.
+        let bytes = unsafe { std::slice::from_raw_parts(s.as_ptr(), len) };
+        assert!(bytes.iter().all(|b| *b == 0));
+    }
 
     const ITEMS: &[u8] = br#"[
         {"type":1,"id":"id-github","name":"GitHub","login":{"username":"octocat","password":"gh-secret"}},
