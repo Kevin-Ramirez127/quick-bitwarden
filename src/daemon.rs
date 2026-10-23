@@ -234,21 +234,12 @@ fn do_show(state: &mut State, paths: &Paths) {
         return;
     }
 
-    // The picker's option id is the short label, so the hidden-list exact-name
-    // path still works. Resolve the corresponding Bitwarden id from `tsv`,
-    // preferring the exact displayed label so duplicate names stay unambiguous.
-    let id = state
-        .tsv
-        .iter()
-        .find(|(name, _)| name == &label)
-        .map(|(_, id)| id.clone())
-        .or_else(|| {
-            state
-                .tsv
-                .iter()
-                .find(|(name, _)| short_label(name) == picked.id)
-                .map(|(_, id)| id.clone())
-        });
+    // Resolve the real Bitwarden id from the row the user picked. The picker
+    // reports the option index (stable across filtering) and the option id is
+    // the short label, which is not unique: two items can display the same
+    // `Name  (user)`. Trusting the label would copy the first match's secret
+    // when the user picked a later duplicate, so use the index.
+    let id = resolve_pick(&state.tsv, &picked).map(|(_, id)| id.clone());
 
     let field = if copy_username {
         "username"
@@ -379,9 +370,40 @@ fn short_label(selection: &str) -> String {
     }
 }
 
+/// Map a picker selection back to the `(label, id)` row the user chose.
+///
+/// `ModalSelection::index` is the index into the option list as sent, even when
+/// the visible list is filtered, so it identifies the row unambiguously. The
+/// option id is the short label (needed by the hidden-list exact-name search)
+/// and therefore not unique. Custom input (a name that matched no row) has no
+/// row: the caller falls back to `bw get <typed text>`.
+fn resolve_pick<'a>(
+    tsv: &'a [(String, String)],
+    sel: &r_modals::ModalSelection,
+) -> Option<&'a (String, String)> {
+    if sel.custom_input {
+        return None;
+    }
+    let row = tsv.get(sel.index)?;
+    (short_label(&row.0) == sel.id).then_some(row)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::short_label;
+    use super::{resolve_pick, short_label};
+    use r_modals::ModalSelection;
+
+    fn selection(index: usize, id: &str, label: &str, custom_input: bool) -> ModalSelection {
+        ModalSelection {
+            id: id.to_string(),
+            label: label.to_string(),
+            index,
+            path: vec![index],
+            query: label.to_string(),
+            custom_input,
+            shortcut: None,
+        }
+    }
 
     #[test]
     fn short_label_matches_bash_parameter_expansion() {
@@ -390,5 +412,33 @@ mod tests {
         // `${s%%  (*}` cuts at the first `  (`.
         assert_eq!(short_label("A  (b)  (c)"), "A");
         assert_eq!(short_label(""), "");
+    }
+
+    #[test]
+    fn resolve_pick_uses_the_row_index_not_the_shared_label() {
+        let tsv = vec![
+            ("GitHub  (octocat)".to_string(), "id-a".to_string()),
+            ("GitHub  (octocat)".to_string(), "id-b".to_string()),
+        ];
+
+        // Two rows share the same label/id; the index picks the exact one.
+        let first = selection(0, "GitHub", "GitHub  (octocat)", false);
+        assert_eq!(
+            resolve_pick(&tsv, &first).map(|(_, id)| id.as_str()),
+            Some("id-a")
+        );
+        let second = selection(1, "GitHub", "GitHub  (octocat)", false);
+        assert_eq!(
+            resolve_pick(&tsv, &second).map(|(_, id)| id.as_str()),
+            Some("id-b")
+        );
+
+        // A mismatched pair is not trusted: the caller falls back to `bw get`.
+        let tampered = selection(1, "Other", "Other", false);
+        assert!(resolve_pick(&tsv, &tampered).is_none());
+
+        // Free-typed input has no row at all.
+        let typed = selection(0, "GitHub", "GitHub", true);
+        assert!(resolve_pick(&tsv, &typed).is_none());
     }
 }
