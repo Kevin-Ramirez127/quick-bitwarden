@@ -38,6 +38,7 @@ pub struct Paths {
 impl Paths {
     pub fn new() -> Self {
         let base = std::env::var_os("QBW_BASE")
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(default_runtime_base)
             .unwrap_or_else(|| PathBuf::from(LEGACY_BASE));
@@ -48,8 +49,10 @@ impl Paths {
             menu_pid: base.join("menu.pid"),
             sel: base.join("sel"),
             base,
-            clear_after: env_u64("QBW_CLEAR_AFTER", 20),
-            refresh_interval: env_i64("QBW_REFRESH_INTERVAL", 30),
+            // Clamp the timing knobs: a typo must not turn the prompt into a
+            // refresh loop or keep a password on the clipboard for days.
+            clear_after: env_u64("QBW_CLEAR_AFTER", 20).min(crate::clipboard::MAX_CLEAR_AFTER),
+            refresh_interval: env_i64("QBW_REFRESH_INTERVAL", 30).clamp(5, 86_400),
         }
     }
 
@@ -199,6 +202,12 @@ fn default_runtime_base() -> Option<PathBuf> {
 /// it is owned by us and private to us. When `create` is set, missing
 /// components are created with mode `0700`.
 fn open_private_dir(path: &Path, create: bool) -> io::Result<std::fs::File> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "is not an absolute path",
+        ));
+    }
     if create {
         match std::fs::DirBuilder::new()
             .recursive(true)
@@ -348,6 +357,16 @@ mod tests {
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn runtime_dir_must_be_absolute() {
+        let paths = paths_in(std::path::Path::new("relative/qbw"));
+        assert!(
+            paths.ensure_private_dir().is_err(),
+            "a relative QBW_BASE would depend on each process's cwd"
+        );
+        assert!(paths.validate_private_dir().is_err());
     }
 
     #[test]

@@ -9,18 +9,53 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// `command -v`: resolve `cmd` on `PATH` to an executable file.
+/// `command -v`: resolve `cmd` on `PATH` to an executable file we can trust.
 pub fn which(cmd: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let cand = dir.join(cmd);
-        if let Ok(md) = std::fs::metadata(&cand) {
-            if md.is_file() && md.permissions().mode() & 0o111 != 0 {
-                return Some(cand);
-            }
+    which_in(cmd, &std::env::var_os("PATH")?)
+}
+
+/// Resolve `cmd` against an explicit `PATH` value.
+///
+/// Only candidates that a different user could not have planted or replaced are
+/// accepted: absolute `PATH` entries, a regular executable owned by us or root,
+/// no group/other write bit on the file, and a directory that is not
+/// world-writable (a sticky directory is fine: others cannot replace our file).
+/// This also avoids resolving relative `PATH` entries against the caller's
+/// working directory.
+fn which_in(cmd: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path) {
+        if !dir.is_absolute() {
+            continue;
         }
+        if !trusted_dir(&dir) {
+            continue;
+        }
+        let cand = dir.join(cmd);
+        if !trusted_executable(&cand) {
+            continue;
+        }
+        return Some(cand);
     }
     None
+}
+
+fn trusted_executable(path: &Path) -> bool {
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !md.is_file() || md.permissions().mode() & 0o111 == 0 {
+        return false;
+    }
+    let owner = md.uid();
+    let ours = owner == unsafe { libc::geteuid() } || owner == 0;
+    ours && md.mode() & 0o022 == 0
+}
+
+fn trusted_dir(path: &Path) -> bool {
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    md.is_dir() && (md.mode() & 0o022 == 0 || md.mode() & 0o1000 != 0)
 }
 
 /// `command -v "$1" >/dev/null 2>&1`.
@@ -266,9 +301,11 @@ pub fn cstr(path: &Path) -> CString {
 #[cfg(test)]
 mod tests {
     use super::{
-        alive, parse_starttime, read_menu_state, read_pid_file, write_menu_state, write_pid_file,
-        Pid,
+        alive, parse_starttime, read_menu_state, read_pid_file, which_in, write_menu_state,
+        write_pid_file, Pid,
     };
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn pid_file_round_trips_and_rejects_a_reused_pid() {
@@ -303,6 +340,41 @@ mod tests {
         let stat = "42 (a)b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 777";
         assert_eq!(parse_starttime(stat), Some(777));
         assert_eq!(parse_starttime("garbage"), None);
+    }
+
+    #[test]
+    fn which_skips_candidates_another_user_could_replace() {
+        let dir = std::env::temp_dir().join(format!(
+            "qbw-which-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("qbw-test-tool");
+        std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = OsString::from(bin.as_os_str());
+        assert_eq!(which_in("qbw-test-tool", &path), Some(tool.clone()));
+
+        // A group/other-writable executable can be swapped by another user.
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(which_in("qbw-test-tool", &path), None);
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A non-sticky world-writable directory has the same problem.
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(which_in("qbw-test-tool", &path), None);
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Relative PATH entries resolve against the caller's cwd: never trust.
+        assert_eq!(which_in("qbw-test-tool", &OsString::from("bin")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
