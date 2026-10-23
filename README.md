@@ -136,6 +136,11 @@ is meaningful.
   `stop`/`restart` (and the daemon does not need to be restarted to pick it
   up). `>show items` removes it.
 
+This is a shoulder-surfing aid, not an access-control boundary: the labels are
+still sent to the picker process (which runs as you), and typing an item's name
+exactly reveals it. It does not change what `bw` will return, and it does not
+protect against someone who can already run commands as your user.
+
 On tiling compositors (sway/Hyprland), float the window via its app id:
 
 ```
