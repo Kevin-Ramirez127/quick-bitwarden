@@ -417,12 +417,14 @@ fn parse_cache(json: &[u8]) -> Option<Cache> {
         if item.kind != Some(1) {
             continue;
         }
-        let name = item.name.clone().unwrap_or_default();
-        let username = item
-            .login
-            .as_ref()
-            .and_then(|l| l.username.clone())
-            .unwrap_or_default();
+        let name = sanitize_label(&item.name.clone().unwrap_or_default());
+        let username = sanitize_label(
+            &item
+                .login
+                .as_ref()
+                .and_then(|l| l.username.clone())
+                .unwrap_or_default(),
+        );
 
         if !name.is_empty() {
             let label = if username.is_empty() {
@@ -443,14 +445,28 @@ fn parse_cache(json: &[u8]) -> Option<Cache> {
     })
 }
 
+/// Replace control characters (newlines, tabs, escapes, …) with spaces.
+///
+/// Labels come from vault items, which can be created by another Bitwarden
+/// user and shared into the collection. A newline would otherwise split one
+/// item into two picker rows (and `menu` lines), and terminal control bytes
+/// have no business in a label.
+fn sanitize_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// `bw get <field> <id-or-name>`.
 ///
 /// Used at pick time so the vault is asked for the secret with the current
 /// session, which makes a lock from another process (or from `bw` itself) take
 /// effect immediately.
 pub fn bw_get_field(session: Option<&str>, field: &str, id_or_name: &str) -> Option<String> {
-    let mut cmd = Command::new("bw");
-    cmd.args(["get", field, id_or_name]);
+    let mut cmd = get_command(field, id_or_name);
     if let Some(s) = session {
         cmd.env("BW_SESSION", s);
     }
@@ -465,9 +481,19 @@ pub fn bw_get_field(session: Option<&str>, field: &str, id_or_name: &str) -> Opt
     )
 }
 
+/// `bw get <field> -- <id-or-name>`.
+///
+/// A free-typed name can start with `-`; without the `--` terminator, `bw`
+/// would parse it as an option (e.g. `--help`) instead of looking it up.
+fn get_command(field: &str, id_or_name: &str) -> Command {
+    let mut cmd = Command::new("bw");
+    cmd.args(["get", field, "--"]).arg(id_or_name);
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_cache, unlock_command, wipe_string, PASSWORD_ENV};
+    use super::{get_command, parse_cache, unlock_command, wipe_string, PASSWORD_ENV};
 
     #[test]
     fn unlock_passes_the_password_via_env_not_argv() {
@@ -495,6 +521,16 @@ mod tests {
             envs,
             vec![(PASSWORD_ENV.to_string(), Some("s3cret".to_string()))]
         );
+    }
+
+    #[test]
+    fn bw_get_terminates_options_before_the_item_name() {
+        let cmd = get_command("password", "--help");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["get", "password", "--", "--help"]);
     }
 
     #[test]
@@ -539,6 +575,23 @@ mod tests {
         let cache = parse_cache(b"[]").expect("an empty array is valid");
         assert!(cache.menu.is_empty());
         assert!(cache.tsv.is_empty());
+    }
+
+    #[test]
+    fn parse_cache_strips_control_characters_from_labels() {
+        // A name shared by another user must not inject extra picker rows.
+        let json = br#"[{"type":1,"id":"id-x",
+            "name":"Evil\nName\t(X)\u001b[31m",
+            "login":{"username":"u\nser"}}]"#;
+        let cache = parse_cache(json).expect("valid vault JSON");
+
+        assert!(
+            cache.menu.chars().all(|c| !c.is_control()),
+            "no control characters may reach the picker: {:?}",
+            cache.menu
+        );
+        assert_eq!(cache.menu, "Evil Name (X) [31m  (u ser)");
+        assert_eq!(cache.tsv.len(), 1);
     }
 
     #[test]
