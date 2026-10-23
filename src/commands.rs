@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::daemon::cleanup_stale;
 use crate::paths::Paths;
-use crate::proc::{self, command_exists, is_fifo, pid_alive, read_pid, send_signal};
+use crate::proc::{self, alive, command_exists, is_fifo, read_pid_file, send_signal};
 use crate::{ui, vault};
 
 /// Refuse to touch a runtime directory another user could have planted.
@@ -23,22 +23,20 @@ fn require_private_dir(paths: &Paths) {
     }
 }
 
-/// `daemon_alive`: pid file points at a live process.
+/// `daemon_alive`: pid file points at the live daemon (same start time).
 pub fn daemon_alive(paths: &Paths) -> bool {
-    read_pid(&paths.pid).map(pid_alive).unwrap_or(false)
+    read_pid_file(&paths.pid).map(alive).unwrap_or(false)
 }
 
 /// `menu_open`: a picker/prompt child is alive.
 pub fn menu_open(paths: &Paths) -> bool {
-    read_pid(&paths.menu_pid).map(pid_alive).unwrap_or(false)
+    read_pid_file(&paths.menu_pid).map(alive).unwrap_or(false)
 }
 
 /// `kill_menu`: close the open picker/prompt child, if any.
 pub fn kill_menu(paths: &Paths) {
-    if menu_open(paths) {
-        if let Some(pid) = read_pid(&paths.menu_pid) {
-            send_signal(pid, libc::SIGTERM);
-        }
+    if let Some(pid) = read_pid_file(&paths.menu_pid) {
+        send_signal(pid, libc::SIGTERM);
     }
 }
 
@@ -263,7 +261,7 @@ fn stop_daemon(paths: &Paths, keep_session: bool) {
 
     if daemon_alive(paths) {
         kill_menu(paths);
-        let pid = read_pid(&paths.pid);
+        let pid = read_pid_file(&paths.pid);
         if let Some(pid) = pid {
             send_signal(pid, libc::SIGTERM);
         }
@@ -302,7 +300,7 @@ pub fn cmd_status(paths: &Paths) {
     } else {
         "shown"
     };
-    let pid = read_pid(&paths.pid).unwrap_or(0);
+    let pid = read_pid_file(&paths.pid).map(|p| p.pid).unwrap_or(0);
     println!("quick-bitwarden: daemon running (pid {pid}), vault: {status}, items: {items}");
 }
 

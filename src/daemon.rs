@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use crate::clipboard;
 use crate::paths::Paths;
-use crate::proc::{self, read_pid, send_signal};
+use crate::proc::{self, read_pid_file, send_signal};
 use crate::ui;
 use crate::vault::{self, State};
 
@@ -52,7 +52,9 @@ pub fn run_daemon(paths: &Paths) {
     let mut busy = false;
     proc::write_menu_state(&paths.menu_state(), generation, busy);
 
-    let _ = std::fs::write(&paths.pid, format!("{}\n", std::process::id()));
+    if let Some(pid) = proc::Pid::current() {
+        let _ = proc::write_pid_file(&paths.pid, pid);
+    }
 
     let _ = std::fs::remove_file(&paths.ctl);
     let ctl = proc::cstr(&paths.ctl);
@@ -359,7 +361,7 @@ fn fetch_field(
 
 /// `cleanup_stale`: drop any leftover picker and runtime files.
 pub fn cleanup_stale(paths: &Paths) {
-    if let Some(pid) = read_pid(&paths.menu_pid) {
+    if let Some(pid) = read_pid_file(&paths.menu_pid) {
         send_signal(pid, libc::SIGTERM);
     }
     paths.remove_runtime_files();
