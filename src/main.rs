@@ -17,6 +17,25 @@ pub fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
+/// Keep secrets out of crash dumps and away from same-user inspection.
+///
+/// `RLIMIT_CORE=0` is inherited across `exec`, so it also covers `bw` and the
+/// clipboard tools, whose memory holds the master password / session key.
+/// `PR_SET_DUMPABLE=0` makes `/proc/<pid>/{mem,environ}` inaccessible to
+/// unprivileged processes and blocks same-user `ptrace`; every q-bw process
+/// calls this before holding a secret (exec resets the flag, so the daemon and
+/// each dialog child set it for themselves).
+fn harden_process() {
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &no_core);
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
+}
+
 fn usage() {
     print!(
         "Usage: quick-bitwarden [COMMAND] [OPTION]\n\
@@ -49,6 +68,9 @@ fn usage() {
 }
 
 fn main() {
+    // No core dumps, no same-user ptrace: done first so every child inherits it.
+    harden_process();
+
     // `umask 077`: session/IPC files are private to the user.
     unsafe { libc::umask(0o077) };
 
@@ -96,5 +118,32 @@ fn main() {
         Some(_) => die(
             "usage: quick-bitwarden [show|hide|toggle|sync|lock|hide-items|show-items|stop|restart|status] (see --help)",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::harden_process;
+
+    #[test]
+    fn hardening_disables_core_dumps_and_same_user_inspection() {
+        harden_process();
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 1,
+            rlim_max: 1,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) }, 0);
+        assert_eq!(
+            (limit.rlim_cur, limit.rlim_max),
+            (0, 0),
+            "core dumps must be disabled (and the limit inherited by children)"
+        );
+
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) },
+            0,
+            "the process must not be dumpable/ptraceable by the same user"
+        );
     }
 }

@@ -177,6 +177,9 @@ The next `show` asks for the master password again. The daemon keeps running.
 - The master password is never stored. The session token lives in a `0600`
   file inside the private runtime directory (`$QBW_BASE/s`) and is removed by
   `lock` and `stop`; `restart` keeps it so the daemon comes back unlocked.
+- Core dumps are disabled at startup (`RLIMIT_CORE=0`, inherited by `bw` and
+  the clipboard tools) and q-bw processes are not dumpable/ptraceable by other
+  same-user processes (`PR_SET_DUMPABLE=0`).
 - Vault passwords are never cached by the daemon or written to disk: each pick
   asks `bw` for the selected field, so locking the vault elsewhere stops
   further copies immediately.
