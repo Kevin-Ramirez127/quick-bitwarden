@@ -171,19 +171,6 @@ pub fn fill_menu(session: &mut DialogSession, tsv: &[(String, String)]) {
     session.close_input();
 }
 
-/// Show the picker for an already-loaded cache and wait for its result.
-pub fn show_menu(paths: &Paths, tsv: &[(String, String)]) -> Option<DialogOutput> {
-    let mut session = start_menu(paths)?;
-    fill_menu(&mut session, tsv);
-    match session.wait() {
-        Ok(output) => Some(output),
-        Err(e) => {
-            error_dialog(paths, &e.to_string());
-            None
-        }
-    }
-}
-
 /// Prompt for the master password (masked) and return it, or `None` when
 /// cancelled / unavailable.
 pub fn ask_password(paths: &Paths, label: &str) -> Option<String> {

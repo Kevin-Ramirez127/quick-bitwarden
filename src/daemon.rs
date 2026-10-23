@@ -5,6 +5,7 @@
 use std::io::{BufRead, BufReader};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 
 use crate::clipboard;
 use crate::paths::Paths;
@@ -89,10 +90,19 @@ pub fn run_daemon(paths: &Paths) {
     // Periodic refreshes run on a worker thread, never on this loop, so a slow
     // `bw list items` cannot delay the next `show`.
     let mut refresh: Option<vault::BackgroundRefresh> = None;
+    // A `bw lock` started by `>lock` runs on a worker too, so a `show` that
+    // follows immediately can paint its loading window before the loop waits
+    // for the lock to finish (the `bw` CLI takes a second or two just to start).
+    let mut pending_lock: Option<JoinHandle<bool>> = None;
 
     loop {
         if STOP.load(Ordering::SeqCst) {
             break;
+        }
+
+        // Apply a lock that finished while the loop was idle.
+        if pending_lock.as_ref().is_some_and(|job| job.is_finished()) {
+            finish_lock(&mut pending_lock, &mut state, paths);
         }
 
         // The FIFO is opened read+write so it never reports EOF; a blocking
@@ -163,7 +173,7 @@ pub fn run_daemon(paths: &Paths) {
                         generation = generation.wrapping_add(1);
                         busy = true;
                         proc::write_menu_state(&paths.menu_state(), generation, busy);
-                        do_show(&mut state, paths);
+                        do_show(&mut state, paths, &mut pending_lock);
                         busy = false;
                         proc::write_menu_state(&paths.menu_state(), generation, busy);
                         // Refresh behind the scenes: the picker has closed, so
@@ -177,18 +187,30 @@ pub fn run_daemon(paths: &Paths) {
                         // `do_sync` installs fresh data itself; drop any pending
                         // background refresh so it cannot resurrect older data.
                         refresh = None;
+                        finish_lock(&mut pending_lock, &mut state, paths);
                         do_sync(&mut state, paths);
                     }
                     "lock" => {
                         // A pending refresh still holds the old session; drop
                         // it so it cannot repopulate the cache after the lock.
                         refresh = None;
-                        do_lock(&mut state, paths);
+                        // Finish a previous lock before starting a new one.
+                        finish_lock(&mut pending_lock, &mut state, paths);
+                        do_lock(&state, &mut pending_lock);
                     }
                     "stop" => break,
                     _ => {}
                 }
             }
+        }
+    }
+
+    // Let an in-flight `bw lock` finish before the process goes away, but do
+    // not report anything from a shutting-down daemon. A successful lock also
+    // invalidates the stored token, so it must not survive for `restart`.
+    if let Some(job) = pending_lock.take() {
+        if job.join().unwrap_or(false) {
+            paths.remove_session();
         }
     }
 
@@ -200,34 +222,43 @@ pub fn run_daemon(paths: &Paths) {
 
 /// `do_show`: pick an item, copy its password, then scrub history and schedule
 /// the clipboard clear.
-fn do_show(state: &mut State, paths: &Paths) {
-    let picked = if state.menu.is_empty() {
-        // Prompt first when we already know the vault needs it, so the
-        // loading window never covers the master-password dialog.
-        if vault::needs_prompt(state, paths) && !vault::prompt_and_unlock(state, paths) {
+fn do_show(state: &mut State, paths: &Paths, pending_lock: &mut Option<JoinHandle<bool>>) {
+    // Open the picker before any `bw` round-trip. Its loading state is the
+    // feedback for the (multi-second) unlock/list, so it must be visible the
+    // moment the user asks for it.
+    let Some(mut session) = ui::start_menu(paths) else {
+        return;
+    };
+
+    // A `>lock` may still be running on its worker. The loading window is
+    // already up, so wait for it before using the session/cache it is about to
+    // invalidate.
+    finish_lock(pending_lock, state, paths);
+
+    if state.menu.is_empty() {
+        let mut current = Some(session);
+
+        // The vault usually needs the master password after a lock. Ask for it
+        // now; `prompt_and_reload` reopens the loading window as soon as the
+        // prompt closes, before the slow `bw unlock`.
+        if vault::needs_prompt(state, paths) && !prompt_and_reload(state, paths, &mut current) {
             return;
         }
-
-        // Open the picker now: it shows its loading message until the (slow)
-        // `bw list items` has populated the menu.
-        let Some(mut session) = ui::start_menu(paths) else {
-            return;
-        };
 
         let mut load = vault::try_load(state, paths);
         if matches!(load, vault::Load::NeedsPassword) {
             // The stored session was stale. Swap the loading window for the
             // password prompt, then reopen it for the actual load.
-            let _ = session.cancel();
-            if !vault::prompt_and_unlock(state, paths) {
+            if !prompt_and_reload(state, paths, &mut current) {
                 return;
             }
-            let Some(reopened) = ui::start_menu(paths) else {
-                return;
-            };
-            session = reopened;
             load = vault::try_load(state, paths);
         }
+
+        let Some(open) = current else {
+            return;
+        };
+        session = open;
 
         match load {
             vault::Load::Loaded => {}
@@ -252,20 +283,15 @@ fn do_show(state: &mut State, paths: &Paths) {
             ui::error_dialog(paths, "No login items in the vault");
             return;
         }
+    }
 
-        ui::fill_menu(&mut session, &state.tsv);
-        match session.wait() {
-            Ok(r_modals::DialogOutput::Picked(sel)) => sel,
-            Ok(_) => return,
-            Err(e) => {
-                ui::error_dialog(paths, &e.to_string());
-                return;
-            }
-        }
-    } else {
-        match ui::show_menu(paths, &state.tsv) {
-            Some(r_modals::DialogOutput::Picked(sel)) => sel,
-            _ => return,
+    ui::fill_menu(&mut session, &state.tsv);
+    let picked = match session.wait() {
+        Ok(r_modals::DialogOutput::Picked(sel)) => sel,
+        Ok(_) => return,
+        Err(e) => {
+            ui::error_dialog(paths, &e.to_string());
+            return;
         }
     };
 
@@ -327,6 +353,65 @@ fn do_show(state: &mut State, paths: &Paths) {
     }
 }
 
+/// Ask for the master password and reopen the loading window before the slow
+/// `bw unlock`, so feedback returns the moment the prompt closes.
+///
+/// `session` is the loading window that is already open; it stays visible
+/// during the status probe and is replaced only by the prompt itself.
+fn prompt_and_reload(
+    state: &mut State,
+    paths: &Paths,
+    session: &mut Option<ui::MenuSession>,
+) -> bool {
+    let request = vault::request_master_password(state, paths, || {
+        if let Some(open) = session.take() {
+            let _ = open.cancel();
+        }
+    });
+
+    match request {
+        vault::PasswordRequest::AlreadyUnlocked => true,
+        vault::PasswordRequest::Cancelled => {
+            if let Some(open) = session.take() {
+                let _ = open.cancel();
+            }
+            false
+        }
+        vault::PasswordRequest::Password(password) => {
+            // Reopen the loading window *before* `bw unlock`, not after it.
+            *session = ui::start_menu(paths);
+            if session.is_none() {
+                return false;
+            }
+            let unlocked = vault::unlock_with_password(state, paths, password);
+            if !unlocked {
+                if let Some(open) = session.take() {
+                    let _ = open.cancel();
+                }
+            }
+            unlocked
+        }
+    }
+}
+
+/// Wait for a `bw lock` started by `>lock` to finish and apply its result.
+fn finish_lock(job: &mut Option<JoinHandle<bool>>, state: &mut State, paths: &Paths) {
+    let Some(job) = job.take() else {
+        return;
+    };
+    if !job.join().unwrap_or(false) {
+        ui::error_dialog(paths, "Could not lock the vault");
+        return;
+    }
+    paths.remove_session();
+    vault::forget_session(state);
+    state.menu.clear();
+    state.tsv.clear();
+    state.last_refresh = 0;
+    state.unlocked = Some(false);
+    ui::notify("Vault locked");
+}
+
 /// `sync`: run `bw sync`, then rebuild the in-memory cache from the fresh data.
 fn do_sync(state: &mut State, paths: &Paths) {
     if !vault::ensure_unlocked(state, paths) {
@@ -342,20 +427,18 @@ fn do_sync(state: &mut State, paths: &Paths) {
     ui::notify("Vault synced");
 }
 
-/// `lock`: lock the vault and forget the session token and cached items, so a
-/// later `show` must ask for the master password again.
-fn do_lock(state: &mut State, paths: &Paths) {
-    if !vault::bw_lock(state.session.as_deref()) {
-        ui::error_dialog(paths, "Could not lock the vault");
-        return;
-    }
-    paths.remove_session();
-    vault::forget_session(state);
-    state.menu.clear();
-    state.tsv.clear();
-    state.last_refresh = 0;
-    state.unlocked = Some(false);
-    ui::notify("Vault locked");
+/// `lock`: start `bw lock` on a worker; [`finish_lock`] forgets the session and
+/// cached items once it finishes, so a later `show` must ask for the master
+/// password again.
+///
+/// The CLI takes a second or two to start, so running it on the FIFO loop would
+/// keep a `show` issued right after `>lock` from even painting its loading
+/// window.
+fn do_lock(state: &State, job: &mut Option<JoinHandle<bool>>) {
+    let session = state.session.clone();
+    *job = Some(std::thread::spawn(move || {
+        vault::bw_lock(session.as_deref())
+    }));
 }
 
 /// Why a per-pick `bw get` failed, so the caller can show a useful message.

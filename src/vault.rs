@@ -165,36 +165,70 @@ pub fn try_load(state: &mut State, paths: &Paths) -> Load {
     }
 }
 
-/// `prompt_and_unlock`: ask for the master password and store the session.
+/// What [`request_master_password`] produced, before the slow `bw unlock`.
+pub enum PasswordRequest {
+    /// The user submitted a password; pass it to [`unlock_with_password`].
+    Password(String),
+    /// The vault turned out to be unlocked already while we were probing.
+    AlreadyUnlocked,
+    /// The user cancelled, or the account is logged out (already reported).
+    Cancelled,
+}
+
+/// Ask for the master password without unlocking yet.
 ///
-/// Does **not** load the cache: the caller owns the loading window, so it can
-/// open it before the (slow) `bw list items` that follows.
-pub fn prompt_and_unlock(state: &mut State, paths: &Paths) -> bool {
+/// Splitting the prompt from `bw unlock` lets the caller close its loading
+/// window only for the prompt itself, then reopen it *before* the slow unlock
+/// and cache load.
+///
+/// `before_prompt` runs after the (optional) probe and immediately before the
+/// dialog appears, so a caller can keep its loading window up for the whole
+/// probe instead of leaving a blank gap.
+pub fn request_master_password(
+    state: &mut State,
+    paths: &Paths,
+    before_prompt: impl FnOnce(),
+) -> PasswordRequest {
     load_session(state, paths);
 
-    // Re-probe: the vault may have been unlocked since `needs_prompt`.
-    match bw_status(state.session.as_deref()).as_str() {
-        "unauthenticated" => {
-            ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
-            state.unlocked = Some(false);
-            return false;
+    // Only probe when a stored session could save the user a prompt. Without
+    // one the vault cannot be read anyway, so asking right away is both faster
+    // and the only way forward; a logged-out account is detected when
+    // `bw unlock` fails. (`bw status` costs ~1.5 s here, all of it in front of
+    // the prompt.)
+    if state.session.is_some() {
+        match bw_status(state.session.as_deref()).as_str() {
+            "unauthenticated" => {
+                ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
+                state.unlocked = Some(false);
+                return PasswordRequest::Cancelled;
+            }
+            "unlocked" => {
+                state.unlocked = Some(true);
+                return PasswordRequest::AlreadyUnlocked;
+            }
+            _ => {}
         }
-        "unlocked" => {
-            state.unlocked = Some(true);
-            return true;
-        }
-        _ => {}
     }
 
-    let mut password = match ui::ask_password(paths, "Master password") {
-        Some(p) if !p.is_empty() => p,
+    // The caller's loading window stayed visible during the probe; swap it for
+    // the prompt only now.
+    before_prompt();
+
+    match ui::ask_password(paths, "Master password") {
+        Some(password) if !password.is_empty() => PasswordRequest::Password(password),
         // Cancelled: remember the vault is locked so the background refresh
         // does not spend a `bw` call probing it again.
         _ => {
             state.unlocked = Some(false);
-            return false;
+            PasswordRequest::Cancelled
         }
-    };
+    }
+}
+
+/// Run `bw unlock` with a password captured by [`request_master_password`] and
+/// store the resulting session token.
+pub fn unlock_with_password(state: &mut State, paths: &Paths, mut password: String) -> bool {
     let token = bw_unlock(&password);
     // Do not leave the master password in freed heap memory (or a core dump).
     wipe_string(&mut password);
@@ -206,9 +240,28 @@ pub fn prompt_and_unlock(state: &mut State, paths: &Paths) -> bool {
             true
         }
         None => {
-            ui::error_dialog(paths, "Could not unlock the vault: wrong master password?");
+            // There was no probe when no session existed, so distinguish a
+            // logged-out account from a typo now.
+            if bw_status(state.session.as_deref()) == "unauthenticated" {
+                ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
+            } else {
+                ui::error_dialog(paths, "Could not unlock the vault: wrong master password?");
+            }
+            state.unlocked = Some(false);
             false
         }
+    }
+}
+
+/// `prompt_and_unlock`: ask for the master password and store the session.
+///
+/// Does **not** load the cache: the caller owns the loading window, so it can
+/// open it before the (slow) `bw list items` that follows.
+pub fn prompt_and_unlock(state: &mut State, paths: &Paths) -> bool {
+    match request_master_password(state, paths, || {}) {
+        PasswordRequest::Password(password) => unlock_with_password(state, paths, password),
+        PasswordRequest::AlreadyUnlocked => true,
+        PasswordRequest::Cancelled => false,
     }
 }
 
