@@ -14,13 +14,15 @@ background daemon.
 It uses Bitwarden CLI `bw` to get your passwords, and shows them in an r-modals
 window so you can select one and just copy it.
 
-quick-bitwarden starts the daemon and stores the data in memory so toggling the
-window is instant.
+quick-bitwarden starts the daemon and stores the item list in memory so toggling
+the window is instant. Passwords are read from `bw` only when you pick an item,
+so a vault locked outside q-bw (for example with `bw lock`) is enforced
+immediately.
 
 Every time the window is hidden, it refreshes the cache only if more than
 `QBW_REFRESH_INTERVAL` seconds elapsed (30 by default).
 
-On **Enter** it copies the password to the clipboard (from memory, no wait) and
+On **Enter** it fetches the password from `bw`, copies it to the clipboard and
 in the background **deletes that password** from `cliphist` immediately, so the
 clipboard history never keeps it; the password stays on the current clipboard
 for `QBW_CLEAR_AFTER` seconds and then is cleared.
@@ -174,7 +176,9 @@ The next `show` asks for the master password again. The daemon keeps running.
 
 - The master password is never stored; the session token lives in
   `$QBW_BASE/s` and expires when the machine shuts down.
-- Vault passwords live only in the daemon's memory, never written to disk.
+- Vault passwords are never cached by the daemon or written to disk: each pick
+  asks `bw` for the selected field, so locking the vault elsewhere stops
+  further copies immediately.
 - On copy: the password is removed from `cliphist` right away (with retries in
   case the watcher writes late) and the current clipboard is cleared after
   `QBW_CLEAR_AFTER` seconds (20 sec by default).

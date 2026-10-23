@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bitwarden CLI access: unlocking, the in-memory cache and password lookup.
 
-use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -12,16 +11,16 @@ use crate::proc::now_secs;
 use crate::ui;
 
 /// Everything the daemon keeps hot between invocations.
+///
+/// Deliberately metadata-only: vault passwords and usernames are fetched from
+/// `bw` at pick time instead of being cached, so locking the vault (in `bw`, or
+/// from another process) is enforced by the CLI on every copy.
 #[derive(Default)]
 pub struct State {
     /// Picker labels, one per line (`cut -f1` of `tsv`).
     pub menu: String,
     /// `(label, id)` pairs, in vault order.
     pub tsv: Vec<(String, String)>,
-    /// `id -> password`, kept in memory only.
-    pub pass: HashMap<String, String>,
-    /// `id -> username`, kept in memory only.
-    pub user: HashMap<String, String>,
     /// Unix time of the last successful cache refresh.
     pub last_refresh: i64,
     /// Current `BW_SESSION` token, if any.
@@ -44,7 +43,6 @@ struct Item {
 #[derive(Deserialize)]
 struct Login {
     username: Option<String>,
-    password: Option<String>,
 }
 
 /// `bw status --raw | jq -r '.status // "unauthenticated"'`.
@@ -297,16 +295,12 @@ pub fn bw_lock(session: Option<&str>) -> bool {
 struct Cache {
     menu: String,
     tsv: Vec<(String, String)>,
-    pass: HashMap<String, String>,
-    user: HashMap<String, String>,
 }
 
 impl Cache {
     fn apply(self, state: &mut State) {
         state.menu = self.menu;
         state.tsv = self.tsv;
-        state.pass = self.pass;
-        state.user = self.user;
     }
 }
 
@@ -411,8 +405,6 @@ fn parse_cache(json: &[u8]) -> Option<Cache> {
 
     let mut tsv: Vec<(String, String)> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
-    let mut pass: HashMap<String, String> = HashMap::new();
-    let mut user: HashMap<String, String> = HashMap::new();
 
     for item in &items {
         if item.kind != Some(1) {
@@ -436,45 +428,20 @@ fn parse_cache(json: &[u8]) -> Option<Cache> {
             }
             labels.push(label);
         }
-
-        if let Some(pw) = item.login.as_ref().and_then(|l| l.password.clone()) {
-            if !pw.is_empty() {
-                if let Some(id) = &item.id {
-                    pass.insert(id.clone(), pw);
-                }
-            }
-        }
-
-        // Usernames are only needed for `Shift+Enter`; keep them out when empty.
-        if let Some(name) = item.login.as_ref().and_then(|l| l.username.clone()) {
-            if !name.is_empty() {
-                if let Some(id) = &item.id {
-                    user.insert(id.clone(), name);
-                }
-            }
-        }
     }
 
     Some(Cache {
         menu: labels.join("\n"),
         tsv,
-        pass,
-        user,
     })
 }
 
-/// `bw get password <id-or-name>` fallback.
-pub fn bw_get_password(session: Option<&str>, id_or_name: &str) -> Option<String> {
-    bw_get(session, "password", id_or_name)
-}
-
-/// `bw get username <id-or-name>` fallback, used by `Shift+Enter`.
-pub fn bw_get_username(session: Option<&str>, id_or_name: &str) -> Option<String> {
-    bw_get(session, "username", id_or_name)
-}
-
 /// `bw get <field> <id-or-name>`.
-fn bw_get(session: Option<&str>, field: &str, id_or_name: &str) -> Option<String> {
+///
+/// Used at pick time so the vault is asked for the secret with the current
+/// session, which makes a lock from another process (or from `bw` itself) take
+/// effect immediately.
+pub fn bw_get_field(session: Option<&str>, field: &str, id_or_name: &str) -> Option<String> {
     let mut cmd = Command::new("bw");
     cmd.args(["get", field, id_or_name]);
     if let Some(s) = session {
@@ -542,7 +509,7 @@ mod tests {
     ]"#;
 
     #[test]
-    fn parse_cache_builds_menu_tsv_and_passwords() {
+    fn parse_cache_builds_menu_and_tsv_without_secrets() {
         let cache = parse_cache(ITEMS).expect("valid vault JSON");
 
         assert_eq!(cache.menu, "GitHub  (octocat)\nGitLab\nNoPass  (u)");
@@ -554,26 +521,10 @@ mod tests {
                 ("NoPass  (u)".to_string(), "id-nopass".to_string()),
             ]
         );
-        assert_eq!(
-            cache.pass.get("id-github").map(String::as_str),
-            Some("gh-secret")
-        );
-        assert_eq!(
-            cache.pass.get("id-gitlab").map(String::as_str),
-            Some("gl-secret")
-        );
-        // Empty passwords and non-login items stay out of the password table.
-        assert!(!cache.pass.contains_key("id-nopass"));
-        assert!(!cache.pass.contains_key("id-note"));
-
-        assert_eq!(
-            cache.user.get("id-github").map(String::as_str),
-            Some("octocat")
-        );
-        assert_eq!(cache.user.get("id-nopass").map(String::as_str), Some("u"));
-        // Empty usernames stay out too.
-        assert!(!cache.user.contains_key("id-gitlab"));
-        assert!(!cache.user.contains_key("id-note"));
+        // Passwords and usernames are never part of the cache: they are fetched
+        // from `bw` when the user actually picks an item.
+        assert!(!cache.menu.contains("gh-secret"));
+        assert!(!cache.menu.contains("gl-secret"));
     }
 
     #[test]
@@ -581,8 +532,6 @@ mod tests {
         let cache = parse_cache(b"[]").expect("an empty array is valid");
         assert!(cache.menu.is_empty());
         assert!(cache.tsv.is_empty());
-        assert!(cache.pass.is_empty());
-        assert!(cache.user.is_empty());
     }
 
     #[test]

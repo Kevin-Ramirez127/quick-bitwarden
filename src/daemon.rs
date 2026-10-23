@@ -250,35 +250,27 @@ fn do_show(state: &mut State, paths: &Paths) {
                 .map(|(_, id)| id.clone())
         });
 
-    let mut value = id
-        .as_ref()
-        .and_then(|id| {
-            if copy_username {
-                state.user.get(id)
-            } else {
-                state.pass.get(id)
-            }
-        })
-        .cloned()
-        .unwrap_or_default();
-
-    if value.is_empty() {
-        let lookup = id.clone().unwrap_or_else(|| label.clone());
-        value = if copy_username {
-            vault::bw_get_username(state.session.as_deref(), &lookup).unwrap_or_default()
-        } else {
-            vault::bw_get_password(state.session.as_deref(), &lookup).unwrap_or_default()
-        };
-        if value.is_empty() {
-            let what = if copy_username {
-                "username"
-            } else {
-                "password"
+    let field = if copy_username {
+        "username"
+    } else {
+        "password"
+    };
+    let lookup = id.as_deref().unwrap_or(label.as_str());
+    let value = match fetch_field(state, paths, field, lookup) {
+        Ok(value) => value,
+        Err(e) => {
+            let why = match e {
+                FetchError::Locked => "the vault is locked",
+                FetchError::Unauthenticated => "not logged in, run 'bw login'",
+                FetchError::Failed => "could not read the vault",
             };
-            ui::error_dialog(paths, &format!("Could not fetch {what} for '{label}'"));
+            ui::error_dialog(
+                paths,
+                &format!("Could not fetch {field} for '{label}': {why}"),
+            );
             return;
         }
-    }
+    };
 
     if !clipboard::copy_password(&value) {
         ui::error_dialog(paths, "Clipboard tool missing (wl-copy, xclip or xsel)");
@@ -327,11 +319,48 @@ fn do_lock(state: &mut State, paths: &Paths) {
     state.session = None;
     state.menu.clear();
     state.tsv.clear();
-    state.pass.clear();
-    state.user.clear();
     state.last_refresh = 0;
     state.unlocked = Some(false);
     ui::notify("Vault locked");
+}
+
+/// Why a per-pick `bw get` failed, so the caller can show a useful message.
+enum FetchError {
+    Locked,
+    Unauthenticated,
+    Failed,
+}
+
+/// Read one field straight from the vault.
+///
+/// The daemon deliberately keeps no decrypted secrets between picks, so this is
+/// the point where a vault lock (from `bw` or any other client) takes effect. A
+/// stale session is retried once after the master-password dialog.
+fn fetch_field(
+    state: &mut State,
+    paths: &Paths,
+    field: &str,
+    lookup: &str,
+) -> Result<String, FetchError> {
+    if let Some(value) = vault::bw_get_field(state.session.as_deref(), field, lookup) {
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+
+    match vault::bw_status(state.session.as_deref()).as_str() {
+        "locked" => {
+            if !vault::prompt_and_unlock(state, paths) {
+                return Err(FetchError::Locked);
+            }
+            match vault::bw_get_field(state.session.as_deref(), field, lookup) {
+                Some(value) if !value.is_empty() => Ok(value),
+                _ => Err(FetchError::Failed),
+            }
+        }
+        "unauthenticated" => Err(FetchError::Unauthenticated),
+        _ => Err(FetchError::Failed),
+    }
 }
 
 /// `cleanup_stale`: drop any leftover picker and runtime files.
