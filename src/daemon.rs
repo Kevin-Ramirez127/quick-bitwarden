@@ -277,7 +277,9 @@ fn do_show(state: &mut State, paths: &Paths) {
         let copied = value.clone();
         std::thread::spawn(move || clipboard::remove_from_history(&copied));
     }
-    {
+    if !clipboard::schedule_clear(paths.clear_after) {
+        // Last resort when re-exec fails (e.g. the binary was deleted):
+        // a thread at least clears while this daemon stays alive.
         let clear_after = paths.clear_after;
         std::thread::spawn(move || clipboard::clear_password(clear_after));
     }

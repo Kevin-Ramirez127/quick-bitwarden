@@ -2,6 +2,7 @@
 //! Clipboard writing/clearing and `cliphist` hygiene.
 
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -44,9 +45,18 @@ fn write_clipboard(program: &str, args: &[&str], data: &str) -> bool {
     child.wait().map(|status| status.success()).unwrap_or(false)
 }
 
+/// Upper bound for the clear delay: a typo in `QBW_CLEAR_AFTER` must not keep
+/// the password on the clipboard for days.
+pub const MAX_CLEAR_AFTER: u64 = 3600;
+
+/// Clamp a user-supplied clear delay to [`MAX_CLEAR_AFTER`].
+pub fn clamp_clear_after(secs: u64) -> u64 {
+    secs.min(MAX_CLEAR_AFTER)
+}
+
 /// `clear_password`: wait, then wipe the current clipboard.
 pub fn clear_password(clear_after: u64) {
-    std::thread::sleep(Duration::from_secs(clear_after));
+    std::thread::sleep(Duration::from_secs(clamp_clear_after(clear_after)));
     if command_exists("wl-copy") {
         let _ = Command::new("wl-copy").arg("-c").status();
     } else if command_exists("xclip") {
@@ -61,6 +71,37 @@ pub fn clear_password(clear_after: u64) {
                 .status();
         }
     }
+}
+
+/// Schedule the clipboard clear in a detached helper process.
+///
+/// A thread inside the daemon dies with the daemon, so `stop`, `restart` or a
+/// crash would leave the password on the clipboard forever. Re-exec this binary
+/// in its own session and let that process sleep and clear. Returns `false` when
+/// the helper could not be spawned (the caller can fall back to a thread).
+pub fn schedule_clear(clear_after: u64) -> bool {
+    if clear_after == 0 {
+        clear_password(0);
+        return true;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut cmd = Command::new(exe);
+    cmd.arg("--clear-clipboard")
+        .arg(clamp_clear_after(clear_after).to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // New session: a signal aimed at the daemon's process group (or its
+    // terminal) does not take the pending clear down with it.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().is_ok()
 }
 
 /// How many of the newest history entries are decoded when looking for the
@@ -167,7 +208,7 @@ fn delete_history_entries(ids: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::remove_from_history;
+    use super::{clamp_clear_after, remove_from_history, MAX_CLEAR_AFTER};
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -206,6 +247,14 @@ mod tests {
             Some(value) => std::env::set_var(name, value),
             None => std::env::remove_var(name),
         }
+    }
+
+    #[test]
+    fn clear_delay_is_clamped() {
+        assert_eq!(clamp_clear_after(20), 20);
+        assert_eq!(clamp_clear_after(0), 0, "0 means clear immediately");
+        assert_eq!(clamp_clear_after(MAX_CLEAR_AFTER + 1), MAX_CLEAR_AFTER);
+        assert_eq!(clamp_clear_after(u64::MAX), MAX_CLEAR_AFTER);
     }
 
     #[test]

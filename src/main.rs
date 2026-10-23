@@ -43,6 +43,7 @@ fn usage() {
          \n\
          Environment:\n\
          \x20 QBW_BASE              Runtime directory (default: $XDG_RUNTIME_DIR/qbw, fallback /tmp/qbw)\n\
+         \x20 QBW_CLEAR_AFTER       Seconds before the clipboard is cleared (default: 20)\n\
          \x20 QBW_REFRESH_INTERVAL  Cache refresh interval in seconds (default: 30)\n"
     );
 }
@@ -56,8 +57,21 @@ fn main() {
     // them before any quick-bitwarden command parsing.
     r_modals::dialog_main!();
 
-    let paths = Paths::new();
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Internal mode: the detached clipboard-clear helper spawned by
+    // `clipboard::schedule_clear`. It must not need the runtime directory or
+    // trigger the picker.
+    if args.first().map(String::as_str) == Some("--clear-clipboard") {
+        let secs = args
+            .get(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(20);
+        clipboard::clear_password(clipboard::clamp_clear_after(secs));
+        return;
+    }
+
+    let paths = Paths::new();
 
     match args.first().map(String::as_str) {
         Some("--daemon") => daemon::run_daemon(&paths),

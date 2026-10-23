@@ -182,7 +182,8 @@ The next `show` asks for the master password again. The daemon keeps running.
   further copies immediately.
 - On copy: the password is removed from `cliphist` right away (with retries in
   case the watcher writes late) and the current clipboard is cleared after
-  `QBW_CLEAR_AFTER` seconds (20 sec by default).
+  `QBW_CLEAR_AFTER` seconds (20 sec by default) by a detached helper, so
+  `stop`/`restart` or a daemon crash does not leave it on the clipboard.
 
 ## Troubleshooting
 
