@@ -45,6 +45,9 @@ pub fn run_daemon(paths: &Paths) {
     };
 
     cleanup_stale(paths);
+    // Move a hide-items marker left in the volatile runtime dir (from an older
+    // version) into the durable state dir before the first picker can open.
+    paths.migrate_hide_items();
     ui::write_default_config(paths);
 
     // Menu state: `"<generation> <busy>"`. The daemon bumps the generation and

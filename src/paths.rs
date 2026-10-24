@@ -18,6 +18,10 @@ const LEGACY_BASE: &str = "/tmp/qbw";
 pub struct Paths {
     /// `QBW_BASE` (default `/tmp/qbw`).
     pub base: PathBuf,
+    /// `$XDG_STATE_HOME/quick-bitwarden` (fallback
+    /// `~/.local/state/quick-bitwarden`) — choices that must survive a logout
+    /// or reboot, such as the hide-items marker.
+    pub state: PathBuf,
     /// `$BASE/s` — Bitwarden session token.
     pub session: PathBuf,
     /// `$BASE/ctl` — control FIFO.
@@ -42,6 +46,11 @@ impl Paths {
             .map(PathBuf::from)
             .or_else(default_runtime_base)
             .unwrap_or_else(|| PathBuf::from(LEGACY_BASE));
+        // Keep durable choices out of `$XDG_RUNTIME_DIR`, which is wiped on
+        // logout/reboot. If neither XDG_STATE_HOME nor HOME is usable, fall
+        // back to the runtime dir rather than failing: the choice then works
+        // for this session, exactly as before.
+        let state = default_state_base().unwrap_or_else(|| base.join("state"));
         Self {
             session: base.join("s"),
             ctl: base.join("ctl"),
@@ -49,6 +58,7 @@ impl Paths {
             menu_pid: base.join("menu.pid"),
             sel: base.join("sel"),
             base,
+            state,
             // Clamp the timing knobs: a typo must not turn the prompt into a
             // refresh loop or keep a password on the clipboard for days.
             clear_after: env_u64("QBW_CLEAR_AFTER", 20).min(crate::clipboard::MAX_CLEAR_AFTER),
@@ -67,29 +77,50 @@ impl Paths {
         self.base.join("config.toml")
     }
 
-    /// `$BASE/hide_items` — present while the picker hides its item list until
-    /// the query is long enough. Kept outside [`Paths::remove_runtime_files`]
-    /// so `stop`/`restart` do not reset the user's choice.
+    /// `$XDG_STATE_HOME/quick-bitwarden/hide_items` (fallback
+    /// `~/.local/state/quick-bitwarden/hide_items`) — present while the picker
+    /// hides its item list until the query is long enough.
+    ///
+    /// This lives in the durable state dir, not in the runtime dir, so the
+    /// choice survives a logout/reboot as well as `stop`/`restart`.
     pub fn hide_items_path(&self) -> PathBuf {
+        self.state.join("hide_items")
+    }
+
+    /// Legacy location: `$QBW_BASE/hide_items`. Only read for migration.
+    fn legacy_hide_items_path(&self) -> PathBuf {
         self.base.join("hide_items")
     }
 
     /// Whether the picker should hide the default item list.
     pub fn items_hidden(&self) -> bool {
-        self.hide_items_path().is_file()
+        self.hide_items_path().is_file() || self.legacy_hide_items_path().is_file()
+    }
+
+    /// Move a marker left in the volatile runtime dir to the state dir.
+    ///
+    /// Best-effort: if the state dir cannot be created (for example because it
+    /// is not private), the legacy marker still applies for this session.
+    pub fn migrate_hide_items(&self) {
+        if !self.hide_items_path().is_file() && self.legacy_hide_items_path().is_file() {
+            let _ = self.set_items_hidden(true);
+        }
     }
 
     /// Persist the hide-items choice. Removing an already-absent marker is not
-    /// an error.
+    /// an error. The state directory is created (or tightened) as `0700` and
+    /// the marker is written as `0600` without following a symlink.
     pub fn set_items_hidden(&self, hidden: bool) -> std::io::Result<()> {
         if hidden {
-            std::fs::write(self.hide_items_path(), b"1\n")
+            open_private_dir(&self.state, true)?;
+            write_private_file(&self.hide_items_path(), b"1\n")?;
+            // Migration is complete: do not leave a second copy behind in the
+            // runtime dir, where it would be wiped on logout.
+            let _ = std::fs::remove_file(self.legacy_hide_items_path());
+            Ok(())
         } else {
-            match std::fs::remove_file(self.hide_items_path()) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            }
+            remove_file_if_exists(&self.hide_items_path())?;
+            remove_file_if_exists(&self.legacy_hide_items_path())
         }
     }
 
@@ -111,6 +142,8 @@ impl Paths {
 
     /// Remove the runtime files (`ctl`, `pid`, `menu.pid`, `sel`, `gen`).
     /// The lock files are intentionally kept: `flock` is tied to the inode.
+    /// Durable choices such as the hide-items marker live in [`Paths::state`]
+    /// and are not touched here.
     pub fn remove_runtime_files(&self) {
         let menu_state = self.menu_state();
         let menu_state_tmp = menu_state.with_extension("tmp");
@@ -198,6 +231,49 @@ fn default_runtime_base() -> Option<PathBuf> {
     Some(dir.join("qbw"))
 }
 
+/// `$XDG_STATE_HOME/quick-bitwarden`, falling back to
+/// `~/.local/state/quick-bitwarden`.
+///
+/// Relative paths are ignored, as the XDG base-directory spec requires. The
+/// state dir is only created on demand (see [`Paths::set_items_hidden`]) and is
+/// verified to be private there.
+fn default_state_base() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return Some(dir.join("quick-bitwarden"));
+        }
+    }
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return None;
+    }
+    Some(home.join(".local").join("state").join("quick-bitwarden"))
+}
+
+/// Write a small state file as `0600`, refusing to follow a symlink.
+fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    // `mode` only applies when the file is created; repair a legacy mode.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Open `path` as a directory without following a final symlink and verify that
 /// it is owned by us and private to us. When `create` is set, missing
 /// components are created with mode `0700`.
@@ -272,6 +348,7 @@ mod tests {
     fn paths_in(base: &std::path::Path) -> Paths {
         Paths {
             base: base.to_path_buf(),
+            state: base.join("state"),
             session: base.join("s"),
             ctl: base.join("ctl"),
             pid: base.join("pid"),
@@ -292,6 +369,16 @@ mod tests {
 
         paths.set_items_hidden(true).unwrap();
         assert!(paths.items_hidden());
+        assert_eq!(
+            std::fs::metadata(paths.hide_items_path()).unwrap().mode() & 0o777,
+            0o600,
+            "the marker must not be readable by other users"
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.state).unwrap().mode() & 0o777,
+            0o700,
+            "the state dir must be private"
+        );
 
         // Runtime cleanup (stop/restart) must not reset the choice.
         paths.remove_runtime_files();
@@ -301,6 +388,31 @@ mod tests {
         assert!(!paths.items_hidden());
         // Idempotent: showing again is not an error.
         paths.set_items_hidden(false).unwrap();
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_hide_items_marker_is_migrated_out_of_the_runtime_dir() {
+        let base = std::env::temp_dir().join(format!("qbw-hide-legacy-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let paths = paths_in(&base);
+        let legacy = paths.base.join("hide_items");
+        std::fs::write(&legacy, b"1\n").unwrap();
+
+        // A pre-upgrade marker still hides the list before migration runs.
+        assert!(paths.items_hidden());
+
+        paths.migrate_hide_items();
+        assert!(paths.hide_items_path().is_file());
+        assert!(!legacy.exists(), "the volatile copy must be removed");
+        assert!(paths.items_hidden());
+
+        // `show-items` also clears a stale legacy marker.
+        std::fs::write(&legacy, b"1\n").unwrap();
+        paths.set_items_hidden(false).unwrap();
+        assert!(!paths.hide_items_path().exists());
+        assert!(!legacy.exists());
 
         let _ = std::fs::remove_dir_all(&base);
     }

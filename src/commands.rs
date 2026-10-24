@@ -152,8 +152,8 @@ pub fn cmd_hide(paths: &Paths) {
 }
 
 /// `hide-items`: keep the picker's item list out of the default view until a
-/// 3+ character search. Persisted in `$QBW_BASE/hide_items`, so it survives
-/// `stop`/`restart`.
+/// 3+ character search. Persisted in the durable state dir, so it survives
+/// `stop`/`restart` and a logout/reboot.
 pub fn cmd_hide_items(paths: &Paths) {
     set_items_hidden(paths, true);
 }
@@ -164,16 +164,10 @@ pub fn cmd_show_items(paths: &Paths) {
 }
 
 fn set_items_hidden(paths: &Paths, hidden: bool) {
-    // The picker child reads the marker itself, so a running daemon picks the
-    // change up on the next `show` without a round-trip.
-    if let Err(e) = paths.ensure_private_dir() {
-        crate::die(&format!(
-            "unsafe runtime directory {}: {e}",
-            paths.base.display()
-        ));
-    }
-    if paths.set_items_hidden(hidden).is_err() {
-        crate::die("could not save the items setting");
+    // The daemon reads the marker when it opens the picker, so a running
+    // daemon picks the change up on the next `show` without a round-trip.
+    if let Err(e) = paths.set_items_hidden(hidden) {
+        crate::die(&format!("could not save the items setting: {e}"));
     }
     let message = if hidden {
         "Item list hidden: type 3+ characters to search"
@@ -328,6 +322,7 @@ mod tests {
     fn paths_in(base: &std::path::Path) -> Paths {
         Paths {
             base: base.to_path_buf(),
+            state: base.join("state"),
             session: base.join("s"),
             ctl: base.join("ctl"),
             pid: base.join("pid"),

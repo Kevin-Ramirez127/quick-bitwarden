@@ -288,6 +288,7 @@ mod tests {
     fn paths_in(base: &std::path::Path) -> Paths {
         Paths {
             base: base.to_path_buf(),
+            state: base.join("state"),
             session: base.join("s"),
             ctl: base.join("ctl"),
             pid: base.join("pid"),

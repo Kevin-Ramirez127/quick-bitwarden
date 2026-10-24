@@ -132,9 +132,11 @@ is meaningful.
 - 3 or more characters: normal case-insensitive matching.
 - Fewer than 3 characters: only an item whose name is typed **exactly** (or
   its short id) is shown.
-- The choice is stored in `$QBW_BASE/hide_items`, so it survives
-  `stop`/`restart` (and the daemon does not need to be restarted to pick it
-  up). `>show items` removes it.
+- The choice is stored in `$XDG_STATE_HOME/quick-bitwarden/hide_items`
+  (falling back to `~/.local/state/quick-bitwarden/hide_items`), so it
+  survives `stop`/`restart` and a logout/reboot (and the daemon does not need
+  to be restarted to pick it up). A marker left by an older version in
+  `$QBW_BASE/hide_items` is migrated automatically. `>show items` removes it.
 
 This is a shoulder-surfing aid, not an access-control boundary: the labels are
 still sent to the picker process (which runs as you), and typing an item's name
