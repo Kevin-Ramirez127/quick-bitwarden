@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bitwarden CLI access: unlocking, the in-memory cache and password lookup.
 
-use std::process::{Command, Stdio};
+use std::io::Read;
+use std::os::unix::io::AsRawFd;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -45,6 +48,122 @@ struct Login {
     username: Option<String>,
 }
 
+/// How long stdout must stay silent before the value counts as complete.
+const OUTPUT_QUIET: Duration = Duration::from_millis(100);
+
+/// Hard cap for one `bw` read, so a wedged CLI cannot block the daemon.
+const OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Largest output we stop early on. `bw get password|username` returns a short
+/// value; anything bigger is not something we should cut mid-write.
+const OUTPUT_EARLY_LIMIT: usize = 1024 * 1024;
+
+/// Run `bw` and return stdout as soon as it stops writing.
+///
+/// `bw` prints the requested value and then keeps its Node event loop alive for
+/// another ~2 s before exiting. [`Command::output`] waits for that shutdown, so
+/// every copy paid for it. A value is a single small write: once the pipe has
+/// been quiet for [`OUTPUT_QUIET`] we have all of it.
+///
+/// If nothing has been written yet we keep waiting, so a failed lookup (which
+/// writes only to stderr) and a slow unlock behave as before. The hard cap
+/// returns `None` instead of a partial value. The child is stopped with
+/// `SIGTERM` first and `SIGKILL` only as a fallback; it is always reaped.
+fn capture_early(cmd: &mut Command) -> Option<Vec<u8>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        stop_child(&mut child);
+        return None;
+    };
+    let fd = stdout.as_raw_fd();
+    let start = Instant::now();
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut complete = false;
+
+    while start.elapsed() < OUTPUT_TIMEOUT {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, OUTPUT_QUIET.as_millis() as libc::c_int) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if rc == 0 {
+            // Quiet window elapsed: done once we have a value, otherwise the
+            // CLI is still working (or about to report an error on stderr).
+            if !data.is_empty() {
+                complete = true;
+                break;
+            }
+            continue;
+        }
+        match stdout.read(&mut buf) {
+            Ok(0) => {
+                // EOF: `bw` exited on its own.
+                complete = true;
+                break;
+            }
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                if data.len() > OUTPUT_EARLY_LIMIT {
+                    // Unexpectedly large: never cut it short.
+                    stop_child(&mut child);
+                    return None;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+
+    // No value: a failed lookup writes only to stderr, so this must be a
+    // failure, never an empty "secret". Stop the child (the pipe closing means
+    // it is already on its way out) and let the caller probe the lock state.
+    if !complete || data.is_empty() {
+        stop_child(&mut child);
+        return None;
+    }
+
+    // A child that is still alive here has already printed its value and is
+    // only idling, so it can be stopped. One that exited on its own keeps the
+    // exit status as the success signal.
+    match child.try_wait() {
+        Ok(Some(status)) if !status.success() => None,
+        Ok(Some(_)) => Some(data),
+        _ => {
+            stop_child(&mut child);
+            Some(data)
+        }
+    }
+}
+
+/// Stop a `bw` child that has already produced its output, and reap it.
+///
+/// `SIGTERM` first, so a lingering CLI can run its exit path; `SIGKILL` only if
+/// it does not go away. The pid cannot be reused while the child is unreaped.
+fn stop_child(child: &mut Child) {
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    for _ in 0..10 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// `bw status --raw | jq -r '.status // "unauthenticated"'`.
 pub fn bw_status(session: Option<&str>) -> String {
     let mut cmd = Command::new("bw");
@@ -52,18 +171,13 @@ pub fn bw_status(session: Option<&str>) -> String {
     if let Some(s) = session {
         cmd.env("BW_SESSION", s);
     }
-    match cmd.output() {
-        Ok(out) if out.status.success() => {
-            let value: serde_json::Value =
-                serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
-            value
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("unauthenticated")
-                .to_string()
-        }
-        _ => "unauthenticated".to_string(),
-    }
+    let out = capture_early(&mut cmd).unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
+    value
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unauthenticated")
+        .to_string()
 }
 
 /// `bw status --raw | jq -r '.status'` for `status` (defaults to `"unknown"`).
@@ -73,18 +187,13 @@ pub fn bw_status_status_only(session: Option<&str>) -> String {
     if let Some(s) = session {
         cmd.env("BW_SESSION", s);
     }
-    match cmd.output() {
-        Ok(out) if out.status.success() => {
-            let value: serde_json::Value =
-                serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
-            value
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("unknown")
-                .to_string()
-        }
-        _ => "unknown".to_string(),
-    }
+    let out = capture_early(&mut cmd).unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
+    value
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// Load the session token file into `state` without contacting the vault or
@@ -523,12 +632,9 @@ pub fn bw_get_field(session: Option<&str>, field: &str, id_or_name: &str) -> Opt
     if let Some(s) = session {
         cmd.env("BW_SESSION", s);
     }
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
+    let out = capture_early(&mut cmd)?;
     Some(
-        String::from_utf8_lossy(&out.stdout)
+        String::from_utf8_lossy(&out)
             .trim_end_matches(['\n', '\r'])
             .to_string(),
     )
@@ -546,7 +652,12 @@ fn get_command(field: &str, id_or_name: &str) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_command, parse_cache, unlock_command, wipe_string, PASSWORD_ENV};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        capture_early, get_command, parse_cache, unlock_command, wipe_string, PASSWORD_ENV,
+    };
 
     #[test]
     fn unlock_passes_the_password_via_env_not_argv() {
@@ -656,5 +767,46 @@ mod tests {
         assert!(parse_cache(b"not json").is_none());
         // A JSON value that is not an item array is equally unusable.
         assert!(parse_cache(b"{}").is_none());
+    }
+
+    #[test]
+    fn capture_early_returns_before_a_lingering_child_exits() {
+        // `bw` prints the value and then keeps running for ~2 s. The reader
+        // must return once the output goes quiet, not wait for the exit.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf secret; exec sleep 5"]);
+
+        let start = Instant::now();
+        let out = capture_early(&mut cmd).expect("value");
+        assert_eq!(out, b"secret");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "waited for the child to exit: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn capture_early_joins_chunks_separated_by_a_short_pause() {
+        // The quiet window must not split a value that arrives in two writes.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf sec; sleep 0.05; printf ret"]);
+        assert_eq!(capture_early(&mut cmd).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn capture_early_keeps_waiting_when_only_stderr_is_written() {
+        // A failed `bw get` writes "Not found." to stderr and nothing to
+        // stdout, so it must never look like a (empty) value.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf boom >&2; exit 1"]);
+        assert!(capture_early(&mut cmd).is_none());
+    }
+
+    #[test]
+    fn capture_early_reads_a_value_and_a_clean_exit() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf value"]);
+        assert_eq!(capture_early(&mut cmd).unwrap(), b"value");
     }
 }
