@@ -49,6 +49,15 @@ fn write_clipboard(program: &str, args: &[&str], data: &str) -> bool {
 /// the password on the clipboard for days.
 pub const MAX_CLEAR_AFTER: u64 = 3600;
 
+/// Wipe the clipboard right now, before the password is fetched.
+///
+/// An old selection would otherwise still be on the clipboard while `bw` looks
+/// up the picked item, so a paste in that window would insert the previous
+/// secret (or any unrelated text) instead of nothing.
+pub fn clear_now() {
+    clear_password(0);
+}
+
 /// Clamp a user-supplied clear delay to [`MAX_CLEAR_AFTER`].
 pub fn clamp_clear_after(secs: u64) -> u64 {
     secs.min(MAX_CLEAR_AFTER)
@@ -208,7 +217,7 @@ fn delete_history_entries(ids: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_clear_after, remove_from_history, MAX_CLEAR_AFTER};
+    use super::{clamp_clear_after, clear_now, remove_from_history, MAX_CLEAR_AFTER};
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -242,6 +251,35 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    fn write_fake_wl_copy(bin: &Path) {
+        std::fs::create_dir_all(bin).unwrap();
+        let script = bin.join("wl-copy");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$FAKE_ARGS\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn temp_bin(name: &str) -> (PathBuf, PathBuf) {
+        let dir = temp_dir(name);
+        let bin = dir.join("bin");
+        write_fake_wl_copy(&bin);
+        (dir, bin)
+    }
+
+    fn with_fake_path<T>(bin: &Path, dir: &Path, f: impl FnOnce() -> T) -> T {
+        let old_path = std::env::var_os("PATH");
+        let old_args = std::env::var_os("FAKE_ARGS");
+        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        std::env::set_var("FAKE_ARGS", dir.join("args"));
+        let value = f();
+        restore("PATH", old_path);
+        restore("FAKE_ARGS", old_args);
+        value
+    }
+
     fn restore(name: &str, value: Option<OsString>) {
         match value {
             Some(value) => std::env::set_var(name, value),
@@ -255,6 +293,19 @@ mod tests {
         assert_eq!(clamp_clear_after(0), 0, "0 means clear immediately");
         assert_eq!(clamp_clear_after(MAX_CLEAR_AFTER + 1), MAX_CLEAR_AFTER);
         assert_eq!(clamp_clear_after(u64::MAX), MAX_CLEAR_AFTER);
+    }
+
+    #[test]
+    fn clear_now_wipes_the_clipboard_immediately() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (dir, bin) = temp_bin("wl-copy");
+
+        with_fake_path(&bin, &dir, clear_now);
+
+        let args = std::fs::read_to_string(dir.join("args")).expect("wl-copy was run");
+        assert_eq!(args, "-c\n", "wl-copy must be asked to clear the clipboard");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

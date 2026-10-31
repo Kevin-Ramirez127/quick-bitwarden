@@ -22,10 +22,11 @@ immediately.
 Every time the window is hidden, it refreshes the cache only if more than
 `QBW_REFRESH_INTERVAL` seconds elapsed (30 by default).
 
-On **Enter** it fetches the password from `bw`, copies it to the clipboard and
-in the background **deletes that password** from `cliphist` immediately, so the
-clipboard history never keeps it; the password stays on the current clipboard
-for `QBW_CLEAR_AFTER` seconds and then is cleared.
+On **Enter** it clears the clipboard first, then fetches the password from `bw`
+and copies it, so an old clipboard entry cannot be pasted while the lookup is in
+flight. In the background it **deletes that password** from `cliphist`
+immediately, so the clipboard history never keeps it; the password stays on the
+current clipboard for `QBW_CLEAR_AFTER` seconds and then is cleared.
 
 The daemon itself never opens a window: each dialog runs in a short-lived child
 process, so `hide`/`toggle` can close it from the outside.

@@ -304,6 +304,11 @@ fn do_show(state: &mut State, paths: &Paths, pending_lock: &mut Option<JoinHandl
         return;
     }
 
+    // The user has chosen an item: drop whatever was on the clipboard before
+    // fetching (`bw get` can take a moment, or fail). Pasting meanwhile must not
+    // yield the previous clipboard contents.
+    clipboard::clear_now();
+
     // Resolve the real Bitwarden id from the row the user picked. The picker
     // reports the option index (stable across filtering) and the option id is
     // the short label, which is not unique: two items can display the same
