@@ -23,6 +23,16 @@ fn require_private_dir(paths: &Paths) {
     }
 }
 
+/// Refuse commands that need the vault when rbw is not installed.
+///
+/// Checking in the client gives an actionable error; the daemon runs detached
+/// and its startup stderr is otherwise easy to miss.
+fn require_rbw() {
+    if !command_exists("rbw") {
+        crate::die("missing dependency: rbw (install rbw and rbw-agent)");
+    }
+}
+
 /// `daemon_alive`: pid file points at the live daemon (same start time).
 pub fn daemon_alive(paths: &Paths) -> bool {
     read_pid_file(&paths.pid).map(alive).unwrap_or(false)
@@ -72,10 +82,19 @@ pub fn ensure_daemon(paths: &Paths) {
         return;
     }
 
+    // The daemon cannot start without rbw. Check here as well so the user gets
+    // the real reason instead of a generic "daemon failed to start": the
+    // daemon's own stderr is detached from the terminal.
+    require_rbw();
+
     cleanup_stale(paths);
 
     let exe =
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("quick-bitwarden"));
+
+    // Keep startup diagnostics. A dependency/config failure happens before the
+    // daemon can open a dialog, and stderr would otherwise be lost.
+    let error_log = paths.open_error_log().ok();
 
     let mut cmd = if command_exists("setsid") {
         let mut c = Command::new("setsid");
@@ -88,8 +107,12 @@ pub fn ensure_daemon(paths: &Paths) {
     };
     cmd.arg("--daemon")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
+    if let Some(file) = error_log {
+        cmd.stderr(Stdio::from(file));
+    } else {
+        cmd.stderr(Stdio::null());
+    }
     let _ = cmd.spawn();
 
     // Poll at 10 ms so a cold start does not wait up to a full 100 ms tick
@@ -100,10 +123,16 @@ pub fn ensure_daemon(paths: &Paths) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    crate::die(&format!(
-        "daemon failed to start (see {}/error.log)",
-        paths.base.display()
-    ));
+    let detail = std::fs::read_to_string(paths.error_log()).unwrap_or_default();
+    let detail = detail.trim();
+    let detail = detail.strip_prefix("quick-bitwarden: ").unwrap_or(detail);
+    if detail.is_empty() {
+        crate::die(&format!(
+            "daemon failed to start (see {}/error.log)",
+            paths.base.display()
+        ));
+    }
+    crate::die(&format!("daemon failed to start: {detail}"));
 }
 
 /// `request_show`: ask the daemon for a picker window exactly once per press.
@@ -190,6 +219,7 @@ pub fn cmd_sync(paths: &Paths) {
 /// running; otherwise this process can lock rbw directly.
 pub fn cmd_lock(paths: &Paths) {
     require_private_dir(paths);
+    require_rbw();
     if daemon_alive(paths) {
         // Close the picker first: the daemon may be blocked serving it, and
         // a stale window must not keep offering items after the lock.
@@ -198,9 +228,6 @@ pub fn cmd_lock(paths: &Paths) {
         return;
     }
 
-    if !command_exists("rbw") {
-        crate::die("missing dependency: rbw");
-    }
     if !vault::rbw_lock(paths) {
         crate::die("could not lock the vault");
     }
@@ -235,6 +262,9 @@ pub fn cmd_stop(paths: &Paths) {
 /// `restart`: cycle the daemon, starting it when it is not running.
 pub fn cmd_restart(paths: &Paths) {
     require_private_dir(paths);
+    // Check before stopping a working daemon: otherwise `restart` would shut
+    // it down and only then discover that the replacement cannot start.
+    require_rbw();
     if daemon_alive(paths) {
         // A restart keeps the unlocked vault: rbw's agent is not touched.
         stop_daemon(paths, true);
@@ -286,9 +316,7 @@ pub fn cmd_status(paths: &Paths) {
         println!("quick-bitwarden: daemon not running");
         return;
     }
-    if !command_exists("rbw") {
-        crate::die("missing dependency: rbw");
-    }
+    require_rbw();
 
     let status = match vault::rbw_status(paths) {
         vault::VaultStatus::Unlocked => "unlocked",

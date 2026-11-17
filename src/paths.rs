@@ -68,6 +68,22 @@ impl Paths {
         self.base.join("error.log")
     }
 
+    /// Create/truncate the private daemon error log.
+    ///
+    /// A daemon that dies during startup (missing dependency, unsafe config,
+    /// …) has no picker to report through, so its stderr goes here. Refuse a
+    /// symlinked target just like the other runtime files: the log lives in a
+    /// private directory, and must not become an arbitrary-write primitive.
+    pub fn open_error_log(&self) -> io::Result<std::fs::File> {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(self.error_log())
+    }
+
     /// `$BASE/config.toml` — query prefixes and keyboard shortcuts loaded by
     /// the picker.
     pub fn config(&self) -> PathBuf {
@@ -559,6 +575,30 @@ mod tests {
 
         // Running it again keeps the same link instead of failing.
         assert_eq!(paths.prepare_pinentry_shim().unwrap(), link);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn error_log_is_private_and_never_follows_a_symlink() {
+        let base = temp_base("error-log");
+        let paths = paths_in(&base);
+        paths.ensure_private_dir().unwrap();
+
+        paths.open_error_log().unwrap();
+        assert_eq!(
+            std::fs::metadata(paths.error_log()).unwrap().mode() & 0o777,
+            0o600,
+            "the log must not be readable by other users"
+        );
+
+        // A planted symlink must not become an arbitrary-write primitive.
+        let target = base.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        std::fs::remove_file(paths.error_log()).unwrap();
+        std::os::unix::fs::symlink(&target, paths.error_log()).unwrap();
+        assert!(paths.open_error_log().is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
 
         let _ = std::fs::remove_dir_all(&base);
     }
