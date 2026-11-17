@@ -7,6 +7,17 @@ The picker and every dialog are rendered by **r-modals**
 (borderless, searchable, X11 + Wayland), and the vault cache lives in a small
 background daemon.
 
+## Screenshots
+
+The screenshots use a synthetic demo vault; all names, usernames and passwords
+are fake.
+
+| Picker | Filtered |
+| --- | --- |
+| ![Item picker](screenshots/01-picker.png) | ![Filtered search](screenshots/02-search.png) |
+| **Master password** | **Wrong password** |
+| ![Master password prompt](screenshots/03-password-prompt.png) | ![Wrong password error](screenshots/04-wrong-password.png) |
+
 ## How it works
 
 `quick-bitwarden` is a **background daemon**:
