@@ -23,6 +23,16 @@ fn require_private_dir(paths: &Paths) {
     }
 }
 
+/// Refuse commands that need the vault when rbw is not installed.
+///
+/// Checking in the client gives an actionable error; the daemon runs detached
+/// and its startup stderr is otherwise easy to miss.
+fn require_rbw() {
+    if !command_exists("rbw") {
+        crate::die("missing dependency: rbw (install rbw and rbw-agent)");
+    }
+}
+
 /// `daemon_alive`: pid file points at the live daemon (same start time).
 pub fn daemon_alive(paths: &Paths) -> bool {
     read_pid_file(&paths.pid).map(alive).unwrap_or(false)
@@ -72,10 +82,19 @@ pub fn ensure_daemon(paths: &Paths) {
         return;
     }
 
+    // The daemon cannot start without rbw. Check here as well so the user gets
+    // the real reason instead of a generic "daemon failed to start": the
+    // daemon's own stderr is detached from the terminal.
+    require_rbw();
+
     cleanup_stale(paths);
 
     let exe =
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("quick-bitwarden"));
+
+    // Keep startup diagnostics. A dependency/config failure happens before the
+    // daemon can open a dialog, and stderr would otherwise be lost.
+    let error_log = paths.open_error_log().ok();
 
     let mut cmd = if command_exists("setsid") {
         let mut c = Command::new("setsid");
@@ -88,8 +107,12 @@ pub fn ensure_daemon(paths: &Paths) {
     };
     cmd.arg("--daemon")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
+    if let Some(file) = error_log {
+        cmd.stderr(Stdio::from(file));
+    } else {
+        cmd.stderr(Stdio::null());
+    }
     let _ = cmd.spawn();
 
     // Poll at 10 ms so a cold start does not wait up to a full 100 ms tick
@@ -100,10 +123,16 @@ pub fn ensure_daemon(paths: &Paths) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    crate::die(&format!(
-        "daemon failed to start (see {}/error.log)",
-        paths.base.display()
-    ));
+    let detail = std::fs::read_to_string(paths.error_log()).unwrap_or_default();
+    let detail = detail.trim();
+    let detail = detail.strip_prefix("quick-bitwarden: ").unwrap_or(detail);
+    if detail.is_empty() {
+        crate::die(&format!(
+            "daemon failed to start (see {}/error.log)",
+            paths.base.display()
+        ));
+    }
+    crate::die(&format!("daemon failed to start: {detail}"));
 }
 
 /// `request_show`: ask the daemon for a picker window exactly once per press.
@@ -178,18 +207,19 @@ fn set_items_hidden(paths: &Paths, hidden: bool) {
     println!("quick-bitwarden: {message}");
 }
 
-/// `sync`: ask the daemon to run `bw sync` and refresh its cache.
+/// `sync`: ask the daemon to run `rbw sync` and refresh its cache.
 pub fn cmd_sync(paths: &Paths) {
     ensure_daemon(paths);
     send_cmd(paths, "sync");
 }
 
-/// `lock`: lock the vault and forget the cached session and item data.
+/// `lock`: lock the vault and forget the cached item data.
 ///
-/// The daemon owns both the session token and the cache, so it does the work
-/// when it is running; otherwise this process can lock `bw` directly.
+/// rbw's agent owns the unlocked keys, so it does the work when the daemon is
+/// running; otherwise this process can lock rbw directly.
 pub fn cmd_lock(paths: &Paths) {
     require_private_dir(paths);
+    require_rbw();
     if daemon_alive(paths) {
         // Close the picker first: the daemon may be blocked serving it, and
         // a stale window must not keep offering items after the lock.
@@ -198,39 +228,45 @@ pub fn cmd_lock(paths: &Paths) {
         return;
     }
 
-    if !command_exists("bw") {
-        crate::die("missing dependency: bw");
-    }
-    let session = std::fs::read_to_string(&paths.session)
-        .ok()
-        .map(|s| s.trim_end_matches(['\n', '\r']).to_string());
-    if !vault::bw_lock(session.as_deref()) {
+    if !vault::rbw_lock(paths) {
         crate::die("could not lock the vault");
     }
-    let _ = std::fs::remove_file(&paths.session);
+    paths.remove_legacy_session();
     println!("quick-bitwarden: vault locked");
 }
 
 /// `stop`: ask the daemon to exit, forcing it after a grace period.
 ///
-/// Stopping forgets the cached session; use `hide` to keep the daemon (and its
-/// session) running.
+/// Stopping forgets the unlocked vault: q-bw stops the daemon and locks rbw, so
+/// the next `show` asks for the master password again. Use `hide` to keep the
+/// daemon (and the unlocked agent) running.
 pub fn cmd_stop(paths: &Paths) {
     require_private_dir(paths);
-    if !daemon_alive(paths) {
+    let was_running = daemon_alive(paths);
+    if was_running {
+        stop_daemon(paths, false);
+    } else {
         cleanup_stale(paths);
-        paths.remove_session();
-        println!("quick-bitwarden: not running");
-        return;
     }
-    stop_daemon(paths, false);
+    // rbw's agent is a separate process. `stop` is the explicit "forget the
+    // session" command, so lock it as well; `restart` deliberately does not.
+    if command_exists("rbw") {
+        let _ = vault::rbw_lock(paths);
+    }
+    paths.remove_legacy_session();
+    if !was_running {
+        println!("quick-bitwarden: not running");
+    }
 }
 
 /// `restart`: cycle the daemon, starting it when it is not running.
 pub fn cmd_restart(paths: &Paths) {
     require_private_dir(paths);
+    // Check before stopping a working daemon: otherwise `restart` would shut
+    // it down and only then discover that the replacement cannot start.
+    require_rbw();
     if daemon_alive(paths) {
-        // A restart keeps the session: the new daemon reloads `$BASE/s`.
+        // A restart keeps the unlocked vault: rbw's agent is not touched.
         stop_daemon(paths, true);
     } else {
         cleanup_stale(paths);
@@ -239,7 +275,7 @@ pub fn cmd_restart(paths: &Paths) {
 }
 
 /// `stop_daemon`: end a live daemon (FIFO `stop`, then signals) and clean up.
-fn stop_daemon(paths: &Paths, keep_session: bool) {
+fn stop_daemon(paths: &Paths, keep_unlocked: bool) {
     if is_fifo(&paths.ctl) {
         if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&paths.ctl) {
             let _ = f.write_all(b"stop\n");
@@ -266,10 +302,10 @@ fn stop_daemon(paths: &Paths, keep_session: bool) {
     }
 
     cleanup_stale(paths);
-    if !keep_session {
-        // The daemon cannot clean up after SIGKILL, and `stop` is an explicit
-        // "forget the session" request.
-        paths.remove_session();
+    if !keep_unlocked {
+        // Drop the token a pre-rbw version may still have left behind. rbw's
+        // agent is locked by `cmd_stop` itself.
+        paths.remove_legacy_session();
     }
 }
 
@@ -280,15 +316,14 @@ pub fn cmd_status(paths: &Paths) {
         println!("quick-bitwarden: daemon not running");
         return;
     }
-    if !command_exists("bw") {
-        crate::die("missing dependency: bw");
-    }
+    require_rbw();
 
-    let session = std::fs::read_to_string(&paths.session)
-        .ok()
-        .map(|s| s.trim_end_matches(['\n', '\r']).to_string());
-
-    let status = vault::bw_status_status_only(session.as_deref());
+    let status = match vault::rbw_status(paths) {
+        vault::VaultStatus::Unlocked => "unlocked",
+        vault::VaultStatus::Locked => "locked",
+        vault::VaultStatus::Unauthenticated => "unauthenticated",
+        vault::VaultStatus::Unknown => "unknown",
+    };
     let items = if paths.items_hidden() {
         "hidden until a 3+ character search"
     } else {
@@ -323,7 +358,6 @@ mod tests {
         Paths {
             base: base.to_path_buf(),
             state: base.join("state"),
-            session: base.join("s"),
             ctl: base.join("ctl"),
             pid: base.join("pid"),
             menu_pid: base.join("menu.pid"),

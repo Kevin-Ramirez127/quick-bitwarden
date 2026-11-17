@@ -14,8 +14,8 @@ use r_modals::{ConfigFile, Dialog, DialogOutput, DialogSession};
 use crate::paths::Paths;
 use crate::proc::{self, command_exists};
 
-/// Shown in the picker window until `bw list items` has produced a menu.
-const LOADING_MESSAGE: &str = "Loading your data from bw…";
+/// Shown in the picker window until `rbw list` has produced a menu.
+const LOADING_MESSAGE: &str = "Loading your data from rbw…";
 
 /// `${selection%%  (*}` — strip the trailing `  (username)` from a label.
 fn short_label(selection: &str) -> String {
@@ -289,7 +289,6 @@ mod tests {
         Paths {
             base: base.to_path_buf(),
             state: base.join("state"),
-            session: base.join("s"),
             ctl: base.join("ctl"),
             pid: base.join("pid"),
             menu_pid: base.join("menu.pid"),

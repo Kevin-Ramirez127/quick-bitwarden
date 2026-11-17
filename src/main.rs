@@ -5,6 +5,7 @@ mod clipboard;
 mod commands;
 mod daemon;
 mod paths;
+mod pinentry;
 mod proc;
 mod ui;
 mod vault;
@@ -19,8 +20,9 @@ pub fn die(msg: &str) -> ! {
 
 /// Keep secrets out of crash dumps and away from same-user inspection.
 ///
-/// `RLIMIT_CORE=0` is inherited across `exec`, so it also covers `bw` and the
-/// clipboard tools, whose memory holds the master password / session key.
+/// `RLIMIT_CORE=0` is inherited across `exec`, so it also covers `rbw`,
+/// `rbw-agent` and the clipboard tools, whose memory holds the master password
+/// and vault keys.
 /// `PR_SET_DUMPABLE=0` makes `/proc/<pid>/{mem,environ}` inaccessible to
 /// unprivileged processes and blocks same-user `ptrace`; every q-bw process
 /// calls this before holding a secret (exec resets the flag, so the daemon and
@@ -36,6 +38,21 @@ fn harden_process() {
     }
 }
 
+/// Whether argv[0] is rbw's `pinentry` shim symlink.
+///
+/// The shim is a symlink to this executable in the private runtime directory;
+/// matching on the basename keeps `--pinentry` available for explicit use.
+fn invoked_as_pinentry() -> bool {
+    std::env::args_os()
+        .next()
+        .and_then(|arg| {
+            std::path::Path::new(&arg)
+                .file_name()
+                .map(|name| name == "pinentry")
+        })
+        .unwrap_or(false)
+}
+
 fn usage() {
     print!(
         "Usage: quick-bitwarden [COMMAND] [OPTION]\n\
@@ -47,7 +64,7 @@ fn usage() {
          \x20 hide           Close the picker menu if open\n\
          \x20 toggle         Open the picker if closed, close it if open (default)\n\
          \x20 sync           Sync the vault and refresh the cache\n\
-         \x20 lock           Lock the vault and forget the cached session\n\
+         \x20 lock           Lock the vault and forget the unlocked keys\n\
          \x20 hide-items     Hide the item list until a 3+ character search\n\
          \x20 show-items     Show the full item list again\n\
          \x20 stop           Stop the background daemon\n\
@@ -71,7 +88,7 @@ fn main() {
     // No core dumps, no same-user ptrace: done first so every child inherits it.
     harden_process();
 
-    // `umask 077`: session/IPC files are private to the user.
+    // `umask 077`: IPC files and the pinentry shim are private to the user.
     unsafe { libc::umask(0o077) };
 
     // Dialog children spawned by `r_modals::Dialog` (the picker, the password
@@ -80,6 +97,13 @@ fn main() {
     r_modals::dialog_main!();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // rbw's agent runs its configured pinentry program. q-bw prepends a
+    // symlink to this binary named `pinentry` on PATH, so answering that
+    // protocol keeps q-bw's own master-password dialog.
+    if invoked_as_pinentry() || args.first().map(String::as_str) == Some("--pinentry") {
+        pinentry::run(&Paths::new());
+    }
 
     // Internal mode: the detached clipboard-clear helper spawned by
     // `clipboard::schedule_clear`. It must not need the runtime directory or

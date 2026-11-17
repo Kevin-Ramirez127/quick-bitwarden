@@ -1,0 +1,92 @@
+[
+  {
+    "name": "AWS Console",
+    "username": "alex@example.com",
+    "password": "demo-aws-7f3a",
+    "uri": "https://console.aws.example"
+  },
+  {
+    "name": "Cloudflare",
+    "username": "admin@example.com",
+    "password": "demo-cloud-2c9e",
+    "uri": "https://dash.cloudflare.example"
+  },
+  {
+    "name": "Discord",
+    "username": "alex.doe",
+    "password": "demo-discord-41bd",
+    "uri": "https://discord.example"
+  },
+  {
+    "name": "Figma",
+    "username": "alex@example.com",
+    "password": "demo-figma-9a02",
+    "uri": "https://figma.example"
+  },
+  {
+    "name": "GitHub",
+    "username": "alex@example.com",
+    "password": "demo-github-6e1d",
+    "uri": "https://github.example"
+  },
+  {
+    "name": "GitLab",
+    "username": "alex@example.com",
+    "password": "demo-gitlab-83cc",
+    "uri": "https://gitlab.example"
+  },
+  {
+    "name": "Hacker News",
+    "username": "alex_doe",
+    "password": "demo-hn-5f7b",
+    "uri": "https://news.ycombinator.example"
+  },
+  {
+    "name": "Home Router",
+    "username": "",
+    "password": "demo-router-10ab",
+    "uri": "http://192.0.2.1"
+  },
+  {
+    "name": "Linear",
+    "username": "alex@example.com",
+    "password": "demo-linear-77de",
+    "uri": "https://linear.example"
+  },
+  {
+    "name": "Notion",
+    "username": "alex@example.com",
+    "password": "demo-notion-b245",
+    "uri": "https://notion.example"
+  },
+  {
+    "name": "Proton Mail",
+    "username": "alex@example.com",
+    "password": "demo-proton-3a91",
+    "uri": "https://mail.proton.example"
+  },
+  {
+    "name": "Spotify",
+    "username": "alex.doe",
+    "password": "demo-spotify-8c40",
+    "uri": "https://spotify.example"
+  },
+  {
+    "name": "Steam",
+    "username": "alex_plays",
+    "password": "demo-steam-e21f",
+    "uri": "https://steam.example"
+  },
+  {
+    "name": "Tailscale",
+    "username": "",
+    "password": "demo-tailscale-44aa",
+    "uri": "https://login.tailscale.example"
+  },
+  {
+    "name": "Work VPN",
+    "username": "alex@corp.example",
+    "password": "demo-vpn-c8d3",
+    "uri": "https://vpn.corp.example"
+  }
+]

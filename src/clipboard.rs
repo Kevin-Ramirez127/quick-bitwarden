@@ -51,7 +51,7 @@ pub const MAX_CLEAR_AFTER: u64 = 3600;
 
 /// Wipe the clipboard right now, before the password is fetched.
 ///
-/// An old selection would otherwise still be on the clipboard while `bw` looks
+/// An old selection would otherwise still be on the clipboard while `rbw` looks
 /// up the picked item, so a paste in that window would insert the previous
 /// secret (or any unrelated text) instead of nothing.
 pub fn clear_now() {
