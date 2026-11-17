@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 //! Thin client commands: start/steer the daemon and manage the open picker.
 
 use std::io::Write;

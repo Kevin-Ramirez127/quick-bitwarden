@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 //! End-to-end checks for the internal helper modes.
 
 use std::os::unix::fs::PermissionsExt;

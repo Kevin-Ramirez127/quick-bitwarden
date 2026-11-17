@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 //! The view layer, built on [`r_modals`].
 //!
 //! The daemon never opens a window itself: every dialog runs in a short-lived

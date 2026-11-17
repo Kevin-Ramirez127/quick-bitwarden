@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 //! The background daemon: keeps the vault cache in memory and answers the
 //! `show`/`stop` commands delivered over the control FIFO.
 
