@@ -1,8 +1,8 @@
 [package]
 name = "quick-bitwarden"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "A quick way to copy your Bitwarden passwords, backed by a daemon and an r-modals picker"
+description = "A quick way to copy your Bitwarden passwords, backed by rbw, a daemon and an r-modals picker"
 license = "MIT"
 repository = "https://github.com/Kevin-Ramirez127/quick-bitwarden"
 readme = "README.md"

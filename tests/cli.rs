@@ -38,7 +38,7 @@ fn daemon_sigterm_cleans_up_and_exits_zero() {
     let dir = temp_dir("daemon-term");
     let base = dir.join("run");
     let bin = dir.join("bin");
-    write_fake_tool(&bin, "bw", "exit 1");
+    write_fake_tool(&bin, "rbw", "exit 1");
     std::fs::create_dir_all(&base).unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_quick-bitwarden"))
@@ -87,6 +87,38 @@ fn daemon_sigterm_cleans_up_and_exits_zero() {
 
     // Reap it so the guard does not try to kill a reused pid.
     let _ = guard.0.take();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pinentry_mode_answers_the_protocol_without_a_display() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let dir = temp_dir("pinentry");
+    let base = dir.join("run");
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quick-bitwarden"))
+        .arg("--pinentry")
+        .env("QBW_BASE", &base)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("pinentry mode starts");
+
+    // A `BYE` needs no dialog at all, so this stays display-independent.
+    child.stdin.take().unwrap().write_all(b"BYE\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("OK "), "greeting expected: {stdout:?}");
+    assert!(
+        stdout.trim_end().ends_with("OK"),
+        "BYE must be acknowledged"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

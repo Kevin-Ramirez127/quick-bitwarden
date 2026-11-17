@@ -1,377 +1,413 @@
 // SPDX-License-Identifier: MIT
-//! Bitwarden CLI access: unlocking, the in-memory cache and password lookup.
+//! rbw access: the in-memory cache and per-pick field lookup.
+//!
+//! rbw keeps the unlocked vault keys in its own `rbw-agent`, so q-bw no longer
+//! carries a session token around. The agent is asked for the item list when
+//! the cache is refreshed, and for one field when the user actually picks an
+//! item, which keeps a vault lock from another client effective immediately.
 
-use std::io::Read;
-use std::os::unix::io::AsRawFd;
-use std::process::{Child, Command, Stdio};
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 
 use crate::paths::Paths;
-use crate::proc::now_secs;
+use crate::proc::{now_secs, which};
 use crate::ui;
 
 /// Everything the daemon keeps hot between invocations.
 ///
 /// Deliberately metadata-only: vault passwords and usernames are fetched from
-/// `bw` at pick time instead of being cached, so locking the vault (in `bw`, or
-/// from another process) is enforced by the CLI on every copy.
+/// `rbw` at pick time instead of being cached, so locking the vault (in `rbw`,
+/// or from another process) is enforced by the agent on every copy.
 #[derive(Default)]
 pub struct State {
-    /// Picker labels, one per line (`cut -f1` of `tsv`).
+    /// Picker labels, one line per item (`cut -f1` of `tsv`).
     pub menu: String,
-    /// `(label, id)` pairs, in vault order.
+    /// `(label, id)` pairs, in rbw's list order (sorted by name).
     pub tsv: Vec<(String, String)>,
     /// Unix time of the last successful cache refresh.
     pub last_refresh: i64,
-    /// Current `BW_SESSION` token, if any.
-    pub session: Option<String>,
-    /// Cached vault lock state: `Some(true)` unlocked, `Some(false)` locked or
-    /// unauthenticated, `None` unknown. Lets us skip a `bw status` round-trip
-    /// whenever we already know the answer.
+    /// Cached vault lock state: `Some(true)` unlocked, `Some(false)` locked,
+    /// logged out or otherwise unable to read. `None` unknown.
     pub unlocked: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct Item {
     #[serde(rename = "type")]
-    kind: Option<i64>,
+    kind: Option<String>,
     name: Option<String>,
     id: Option<String>,
-    login: Option<Login>,
+    user: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct Login {
-    username: Option<String>,
-}
-
-/// How long stdout must stay silent before the value counts as complete.
-const OUTPUT_QUIET: Duration = Duration::from_millis(100);
-
-/// Hard cap for one `bw` read, so a wedged CLI cannot block the daemon.
-const OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Largest output we stop early on. `bw get password|username` returns a short
-/// value; anything bigger is not something we should cut mid-write.
-const OUTPUT_EARLY_LIMIT: usize = 1024 * 1024;
-
-/// Run `bw` and return stdout as soon as it stops writing.
-///
-/// `bw` prints the requested value and then keeps its Node event loop alive for
-/// another ~2 s before exiting. [`Command::output`] waits for that shutdown, so
-/// every copy paid for it. A value is a single small write: once the pipe has
-/// been quiet for [`OUTPUT_QUIET`] we have all of it.
-///
-/// If nothing has been written yet we keep waiting, so a failed lookup (which
-/// writes only to stderr) and a slow unlock behave as before. The hard cap
-/// returns `None` instead of a partial value. The child is stopped with
-/// `SIGTERM` first and `SIGKILL` only as a fallback; it is always reaped.
-fn capture_early(cmd: &mut Command) -> Option<Vec<u8>> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let Some(mut stdout) = child.stdout.take() else {
-        stop_child(&mut child);
-        return None;
-    };
-    let fd = stdout.as_raw_fd();
-    let start = Instant::now();
-    let mut data = Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut complete = false;
-
-    while start.elapsed() < OUTPUT_TIMEOUT {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, OUTPUT_QUIET.as_millis() as libc::c_int) };
-        if rc < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
-        if rc == 0 {
-            // Quiet window elapsed: done once we have a value, otherwise the
-            // CLI is still working (or about to report an error on stderr).
-            if !data.is_empty() {
-                complete = true;
-                break;
-            }
-            continue;
-        }
-        match stdout.read(&mut buf) {
-            Ok(0) => {
-                // EOF: `bw` exited on its own.
-                complete = true;
-                break;
-            }
-            Ok(n) => {
-                data.extend_from_slice(&buf[..n]);
-                if data.len() > OUTPUT_EARLY_LIMIT {
-                    // Unexpectedly large: never cut it short.
-                    stop_child(&mut child);
-                    return None;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        }
-    }
-
-    // No value: a failed lookup writes only to stderr, so this must be a
-    // failure, never an empty "secret". Stop the child (the pipe closing means
-    // it is already on its way out) and let the caller probe the lock state.
-    if !complete || data.is_empty() {
-        stop_child(&mut child);
-        return None;
-    }
-
-    // A child that is still alive here has already printed its value and is
-    // only idling, so it can be stopped. One that exited on its own keeps the
-    // exit status as the success signal.
-    match child.try_wait() {
-        Ok(Some(status)) if !status.success() => None,
-        Ok(Some(_)) => Some(data),
-        _ => {
-            stop_child(&mut child);
-            Some(data)
-        }
-    }
-}
-
-/// Stop a `bw` child that has already produced its output, and reap it.
-///
-/// `SIGTERM` first, so a lingering CLI can run its exit path; `SIGKILL` only if
-/// it does not go away. The pid cannot be reused while the child is unreaped.
-fn stop_child(child: &mut Child) {
-    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-    for _ in 0..10 {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            _ => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// `bw status --raw | jq -r '.status // "unauthenticated"'`.
-pub fn bw_status(session: Option<&str>) -> String {
-    let mut cmd = Command::new("bw");
-    cmd.args(["status", "--raw"]);
-    if let Some(s) = session {
-        cmd.env("BW_SESSION", s);
-    }
-    let out = capture_early(&mut cmd).unwrap_or_default();
-    let value: serde_json::Value = serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
-    value
-        .get("status")
-        .and_then(|s| s.as_str())
-        .unwrap_or("unauthenticated")
-        .to_string()
-}
-
-/// `bw status --raw | jq -r '.status'` for `status` (defaults to `"unknown"`).
-pub fn bw_status_status_only(session: Option<&str>) -> String {
-    let mut cmd = Command::new("bw");
-    cmd.args(["status", "--raw"]);
-    if let Some(s) = session {
-        cmd.env("BW_SESSION", s);
-    }
-    let out = capture_early(&mut cmd).unwrap_or_default();
-    let value: serde_json::Value = serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
-    value
-        .get("status")
-        .and_then(|s| s.as_str())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-/// Load the session token file into `state` without contacting the vault or
-/// prompting for anything.
-pub fn load_session(state: &mut State, paths: &Paths) {
-    if let Ok(s) = std::fs::read_to_string(&paths.session) {
-        state.session = Some(s.trim_end_matches(['\n', '\r']).to_string());
-    }
-}
-
-/// Forget the in-memory session token and wipe its buffer.
-pub fn forget_session(state: &mut State) {
-    if let Some(mut token) = state.session.take() {
-        wipe_string(&mut token);
-    }
+/// Outcome of probing rbw's agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VaultStatus {
+    /// The local database is unlocked and can be read.
+    Unlocked,
+    /// rbw is configured, but the database (or the agent) is locked.
+    Locked,
+    /// rbw has not been configured/logged in yet.
+    Unauthenticated,
+    /// The probe failed for another reason.
+    Unknown,
 }
 
 /// Outcome of a cache load that never prompts.
 pub enum Load {
     /// The vault is unlocked and the in-memory cache is populated.
     Loaded,
-    /// The vault is locked; the caller must run [`prompt_and_unlock`].
+    /// The vault is locked; the caller must run [`unlock`].
     NeedsPassword,
-    /// Not logged in (`bw login` is required).
+    /// Not logged in (`rbw login` is required).
     Unauthenticated,
-    /// `bw` failed for another reason.
+    /// rbw failed for another reason.
     Failed,
 }
 
-/// `needs_prompt`: true when we already know a password dialog is required.
+/// Resolve `rbw` once, using the same trusted-`PATH` rules as every other
+/// helper binary (absolute entries, executable we or root own).
+fn rbw_program() -> &'static PathBuf {
+    static RBW: OnceLock<PathBuf> = OnceLock::new();
+    RBW.get_or_init(|| which("rbw").unwrap_or_else(|| PathBuf::from("rbw")))
+}
+
+/// `PATH` with q-bw's private `pinentry` shim in front.
 ///
-/// Deliberately conservative: a stored session that turns out to be stale is
-/// handled by [`try_load`] returning [`Load::NeedsPassword`], not by probing
-/// here (a `bw status` would add ~1.5 s to the common cold show).
+/// rbw runs the program named by its `pinentry` config setting (default
+/// `pinentry`) from `PATH`, so this is how the master-password prompt becomes
+/// q-bw's own r-modals dialog without editing the user's rbw config.
+fn rbw_path(paths: &Paths) -> OsString {
+    let shim = paths.pinentry_dir();
+    match std::env::var_os("PATH") {
+        Some(path) if !path.is_empty() => {
+            let mut value = shim.into_os_string();
+            value.push(":");
+            value.push(path);
+            value
+        }
+        _ => shim.into_os_string(),
+    }
+}
+
+/// A command that talks to `rbw` (and, indirectly, `rbw-agent`).
+fn rbw_command(paths: &Paths) -> Command {
+    let mut cmd = Command::new(rbw_program());
+    cmd.env("PATH", rbw_path(paths))
+        // Keep a missing terminal from turning an unlock into a tty prompt;
+        // the pinentry shim uses the graphical dialog instead.
+        .stdin(Stdio::null());
+
+    // rbw looks for `rbw-agent` on PATH. When both binaries live next to each
+    // other (as they do in every package), point at the sibling so a PATH that
+    // contains only the `rbw` symlink still works.
+    if let Some(dir) = rbw_program().parent() {
+        let agent = dir.join("rbw-agent");
+        if agent.is_file() {
+            cmd.env("RBW_AGENT", agent);
+        }
+    }
+    cmd
+}
+
+/// `rbw unlocked`: does the agent currently hold the vault keys?
+pub fn rbw_status(paths: &Paths) -> VaultStatus {
+    match rbw_command(paths).arg("unlocked").output() {
+        Ok(out) if out.status.success() => VaultStatus::Unlocked,
+        Ok(out) => classify_probe(&out),
+        Err(_) => VaultStatus::Unknown,
+    }
+}
+
+/// Map a failed `rbw unlocked` to a state.
+fn classify_probe(out: &Output) -> VaultStatus {
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    if !rbw_is_configured() || !rbw_is_logged_in() {
+        return VaultStatus::Unauthenticated;
+    }
+    if stderr.contains("agent is locked") || stderr.contains("agent not running") {
+        VaultStatus::Locked
+    } else if stderr.contains("config") || stderr.contains("email") {
+        VaultStatus::Unauthenticated
+    } else {
+        VaultStatus::Unknown
+    }
+}
+
+/// Whether rbw has an email configured, honouring `XDG_CONFIG_HOME` and
+/// `RBW_PROFILE` the same way rbw's own `directories` lookup does.
+fn rbw_is_configured() -> bool {
+    rbw_config()
+        .get("email")
+        .and_then(|email| email.as_str())
+        .is_some_and(|email| !email.is_empty())
+}
+
+/// rbw's `config.json`, or an empty object when it cannot be read.
+fn rbw_config() -> serde_json::Value {
+    let Some(path) = rbw_config_file() else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+}
+
+/// Whether rbw has a usable local database for the configured account.
+///
+/// `rbw unlock` runs rbw's login flow first. With no database that flow asks
+/// for an API key in pinentry (and would otherwise send *that* request to
+/// q-bw's master-password dialog), so it must be detected before the agent is
+/// started. `rbw` stores the database under its cache directory, named after
+/// the server and email, with `/`, `:` and `%` percent-encoded.
+fn rbw_is_logged_in() -> bool {
+    let Some(file) = rbw_db_file() else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    let Ok(db) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let present = |key: &str| {
+        db.get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty())
+    };
+    present("access_token") && present("refresh_token") && present("protected_key")
+}
+
+/// `$XDG_CACHE_HOME/rbw[-profile]`, like rbw's `directories` lookup.
+fn rbw_cache_dir() -> Option<PathBuf> {
+    let profile = match std::env::var("RBW_PROFILE") {
+        Ok(profile) if !profile.is_empty() => format!("rbw-{profile}"),
+        _ => "rbw".to_string(),
+    };
+    Some(xdg_base("XDG_CACHE_HOME", ".cache")?.join(profile))
+}
+
+/// An absolute XDG directory, falling back to the matching `$HOME` path.
+fn xdg_base(variable: &str, home_suffix: &str) -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return Some(dir);
+        }
+    }
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(home_suffix))
+}
+
+/// rbw's database path for the configured account.
+fn rbw_db_file() -> Option<PathBuf> {
+    let config = rbw_config();
+    let email = config
+        .get("email")
+        .and_then(|email| email.as_str())
+        .filter(|email| !email.is_empty())?;
+    let server = config
+        .get("base_url")
+        .and_then(|base_url| base_url.as_str())
+        .unwrap_or("default");
+    Some(rbw_cache_dir()?.join(format!("{}:{email}.json", encode_server(server))))
+}
+
+/// Percent-encode the characters rbw escapes in its database filename.
+fn encode_server(server: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = Vec::with_capacity(server.len());
+    for byte in server.bytes() {
+        if byte < 0x20 || byte == 0x7f || matches!(byte, b'/' | b'%' | b':') {
+            out.push(b'%');
+            out.push(HEX[(byte >> 4) as usize]);
+            out.push(HEX[(byte & 0x0f) as usize]);
+        } else {
+            out.push(byte);
+        }
+    }
+    // The input is UTF-8; only ASCII bytes are escaped, so this is still UTF-8.
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// Whether rbw will resolve `pinentry` through `PATH`.
+///
+/// q-bw shadows the default `pinentry` program with its own dialog by putting
+/// a private symlink first on the agent's `PATH`. An absolute or custom
+/// `pinentry` path in the user's rbw config bypasses that, which would hand the
+/// master password to a terminal prompt instead of q-bw's window. Treat a
+/// missing setting as the default.
+fn pinentry_is_shimable(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.is_empty() || value == "pinentry")
+}
+
+/// `rbw_pinentry_is_shimable`: the user's config lets q-bw supply the prompt.
+pub fn rbw_pinentry_is_shimable() -> bool {
+    pinentry_is_shimable(
+        rbw_config()
+            .get("pinentry")
+            .and_then(|pinentry| pinentry.as_str()),
+    )
+}
+
+/// Explain how to restore q-bw's master-password dialog.
+pub const PINENTRY_HELP: &str = "rbw's pinentry setting bypasses q-bw's password dialog. Run \
+     'rbw config set pinentry pinentry' to use the default.";
+
+fn rbw_config_file() -> Option<PathBuf> {
+    let profile = match std::env::var("RBW_PROFILE") {
+        Ok(profile) if !profile.is_empty() => format!("rbw-{profile}"),
+        _ => "rbw".to_string(),
+    };
+    Some(
+        xdg_base("XDG_CONFIG_HOME", ".config")?
+            .join(profile)
+            .join("config.json"),
+    )
+}
+
+/// `needs_prompt`: true when the caller should unlock before reading.
+///
+/// A known-unlocked state is trusted, so a warm daemon does not spawn a probe
+/// for every `show`. The probe itself is cheap (`rbw unlocked`), unlike the
+/// old `bw status` round-trip.
 pub fn needs_prompt(state: &mut State, paths: &Paths) -> bool {
-    load_session(state, paths);
-    state.session.is_none() || state.unlocked == Some(false)
+    if state.unlocked.is_none() {
+        state.unlocked = Some(rbw_status(paths) == VaultStatus::Unlocked);
+    }
+    state.unlocked != Some(true)
 }
 
 /// `try_load`: populate the cache without ever prompting.
 ///
-/// The unlock check is folded into the cache load: when a session token is
-/// stored, `bw list items` doubles as the probe, so an already-unlocked vault
-/// costs a single `bw` call instead of `bw status` **plus** `bw list items`.
+/// rbw's `list`/`get` automatically unlock (and can therefore open a password
+/// prompt), so the lock state is probed first and a locked vault is never
+/// handed to `rbw list`.
 pub fn try_load(state: &mut State, paths: &Paths) -> Load {
-    load_session(state, paths);
-
     // Already warm with data (e.g. `sync`): no need to re-list first.
     if state.unlocked == Some(true) && !state.menu.is_empty() {
         return Load::Loaded;
     }
 
-    // A stored session lets `bw list items` double as the unlock probe. Skip it
-    // when we already know the vault is locked, to avoid a doomed `bw` call.
-    if state.unlocked != Some(false) && state.session.is_some() && refresh_cache(state, paths) {
-        state.unlocked = Some(true);
-        return Load::Loaded;
-    }
-
-    match bw_status(state.session.as_deref()).as_str() {
-        "unlocked" => {
+    match fetch_cache(paths) {
+        ListOutcome::Cache(cache) => {
+            cache.apply(state);
+            state.last_refresh = now_secs();
             state.unlocked = Some(true);
-            if refresh_cache(state, paths) {
-                Load::Loaded
-            } else {
-                Load::Failed
-            }
+            Load::Loaded
         }
-        "locked" => {
+        ListOutcome::Locked => {
             state.unlocked = Some(false);
             Load::NeedsPassword
         }
-        "unauthenticated" => {
+        ListOutcome::Unauthenticated => {
             state.unlocked = Some(false);
             Load::Unauthenticated
         }
-        _ => Load::Failed,
+        ListOutcome::Failed => Load::Failed,
     }
 }
 
-/// What [`request_master_password`] produced, before the slow `bw unlock`.
-pub enum PasswordRequest {
-    /// The user submitted a password; pass it to [`unlock_with_password`].
-    Password(String),
-    /// The vault turned out to be unlocked already while we were probing.
-    AlreadyUnlocked,
-    /// The user cancelled, or the account is logged out (already reported).
-    Cancelled,
-}
-
-/// Ask for the master password without unlocking yet.
+/// Unlock the vault through rbw.
 ///
-/// Splitting the prompt from `bw unlock` lets the caller close its loading
-/// window only for the prompt itself, then reopen it *before* the slow unlock
-/// and cache load.
-///
-/// `before_prompt` runs after the (optional) probe and immediately before the
-/// dialog appears, so a caller can keep its loading window up for the whole
-/// probe instead of leaving a blank gap.
-pub fn request_master_password(
-    state: &mut State,
-    paths: &Paths,
-    before_prompt: impl FnOnce(),
-) -> PasswordRequest {
-    load_session(state, paths);
+/// The password prompt is shown by the `pinentry` shim while `rbw unlock` runs,
+/// so it is still q-bw's dialog and the master password never passes through an
+/// argument vector or a file.
+pub fn unlock(state: &mut State, paths: &Paths) -> bool {
+    // Recreate the shim in case it is missing after an upgrade.
+    let _ = paths.prepare_pinentry_shim();
+    let _ = paths.take_pinentry_result();
 
-    // Only probe when a stored session could save the user a prompt. Without
-    // one the vault cannot be read anyway, so asking right away is both faster
-    // and the only way forward; a logged-out account is detected when
-    // `bw unlock` fails. (`bw status` costs ~1.5 s here, all of it in front of
-    // the prompt.)
-    if state.session.is_some() {
-        match bw_status(state.session.as_deref()).as_str() {
-            "unauthenticated" => {
-                ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
-                state.unlocked = Some(false);
-                return PasswordRequest::Cancelled;
-            }
-            "unlocked" => {
-                state.unlocked = Some(true);
-                return PasswordRequest::AlreadyUnlocked;
-            }
-            _ => {}
+    // A custom pinentry path would bypass the shim and ask for the master
+    // password in a terminal. Refuse before rbw can start the agent.
+    if !rbw_pinentry_is_shimable() {
+        ui::error_dialog(paths, PINENTRY_HELP);
+        state.unlocked = Some(false);
+        return false;
+    }
+
+    match rbw_status(paths) {
+        VaultStatus::Unlocked => {
+            state.unlocked = Some(true);
+            return true;
         }
-    }
-
-    // The caller's loading window stayed visible during the probe; swap it for
-    // the prompt only now.
-    before_prompt();
-
-    match ui::ask_password(paths, "Master password") {
-        Some(password) if !password.is_empty() => PasswordRequest::Password(password),
-        // Cancelled: remember the vault is locked so the background refresh
-        // does not spend a `bw` call probing it again.
-        _ => {
+        VaultStatus::Unauthenticated => {
+            ui::error_dialog(paths, "Not logged in. Run 'rbw login' first.");
             state.unlocked = Some(false);
-            PasswordRequest::Cancelled
+            return false;
         }
+        VaultStatus::Locked | VaultStatus::Unknown => {}
     }
-}
 
-/// Run `bw unlock` with a password captured by [`request_master_password`] and
-/// store the resulting session token.
-pub fn unlock_with_password(state: &mut State, paths: &Paths, mut password: String) -> bool {
-    let token = bw_unlock(&password);
-    // Do not leave the master password in freed heap memory (or a core dump).
-    wipe_string(&mut password);
-    match token {
-        Some(token) => {
-            let _ = paths.write_session(&token);
-            state.session = Some(token);
+    // A locked agent started by another program may not have q-bw's pinentry
+    // shim on its PATH (the agent inherits the environment of whichever
+    // command started it). Since it holds no keys, restarting it is lossless
+    // and makes sure the next prompt is q-bw's dialog.
+    if rbw_status(paths) == VaultStatus::Locked {
+        let _ = rbw_command(paths).arg("stop-agent").output();
+    }
+
+    match rbw_command(paths).arg("unlock").output() {
+        Ok(out) if out.status.success() => {
+            let _ = paths.take_pinentry_result();
             state.unlocked = Some(true);
             true
         }
-        None => {
-            // There was no probe when no session existed, so distinguish a
-            // logged-out account from a typo now.
-            if bw_status(state.session.as_deref()) == "unauthenticated" {
-                ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
-            } else {
-                ui::error_dialog(paths, "Could not unlock the vault: wrong master password?");
-            }
+        Ok(out) => {
+            report_unlock_failure(paths, &out);
+            state.unlocked = Some(false);
+            false
+        }
+        Err(_) => {
+            ui::error_dialog(paths, "Could not unlock the vault: rbw is not runnable");
             state.unlocked = Some(false);
             false
         }
     }
 }
 
-/// `prompt_and_unlock`: ask for the master password and store the session.
-///
-/// Does **not** load the cache: the caller owns the loading window, so it can
-/// open it before the (slow) `bw list items` that follows.
-pub fn prompt_and_unlock(state: &mut State, paths: &Paths) -> bool {
-    match request_master_password(state, paths, || {}) {
-        PasswordRequest::Password(password) => unlock_with_password(state, paths, password),
-        PasswordRequest::AlreadyUnlocked => true,
-        PasswordRequest::Cancelled => false,
+/// Surface why `rbw unlock` failed, staying silent when the user cancelled.
+fn report_unlock_failure(paths: &Paths, out: &Output) {
+    match paths.take_pinentry_result().as_deref() {
+        // Escape in the password dialog: the old flow returned quietly.
+        Some("cancelled") => {}
+        // rbw retries a rejected password up to three times; the shim stops the
+        // retries on the first `SETERROR` so the user sees one prompt and one
+        // error, exactly like before.
+        Some("retry" | "submitted") => {
+            ui::error_dialog(paths, "Could not unlock the vault: wrong master password?");
+        }
+        _ => {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+            if !rbw_is_configured()
+                || !rbw_is_logged_in()
+                || stderr.contains("config")
+                || stderr.contains("email")
+                || stderr.contains("load db")
+                || stderr.contains("failed to log in")
+                || stderr.contains("failed to register")
+            {
+                ui::error_dialog(paths, "Not logged in. Run 'rbw login' first.");
+            } else {
+                ui::error_dialog(paths, "Could not unlock the vault: wrong master password?");
+            }
+        }
     }
+}
+
+/// `prompt_and_unlock`: unlock (prompting through rbw) without loading the
+/// cache, so the caller can keep its loading window around the slow part.
+pub fn prompt_and_unlock(state: &mut State, paths: &Paths) -> bool {
+    unlock(state, paths)
 }
 
 /// `ensure_unlocked`: unlock (prompting if needed) and populate the cache.
@@ -383,9 +419,9 @@ pub fn prompt_and_unlock(state: &mut State, paths: &Paths) -> bool {
 pub fn ensure_unlocked(state: &mut State, paths: &Paths) -> bool {
     match try_load(state, paths) {
         Load::Loaded => true,
-        Load::NeedsPassword => prompt_and_unlock(state, paths) && refresh_cache(state, paths),
+        Load::NeedsPassword => unlock(state, paths) && refresh_cache(state, paths),
         Load::Unauthenticated => {
-            ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
+            ui::error_dialog(paths, "Not logged in. Run 'rbw login' first.");
             false
         }
         Load::Failed => {
@@ -395,72 +431,25 @@ pub fn ensure_unlocked(state: &mut State, paths: &Paths) -> bool {
     }
 }
 
-/// `bw unlock --passwordenv … --raw`: return the session token.
-///
-/// The password is passed through the environment, never argv: a positional
-/// password is world-readable in `/proc/<pid>/cmdline` (and `ps`) for as long as
-/// `bw` runs.
-fn bw_unlock(password: &str) -> Option<String> {
-    let out = unlock_command(password).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .trim_end_matches(['\n', '\r'])
-            .to_string(),
-    )
-}
-
-/// Name of the environment variable read by `bw unlock --passwordenv`.
-const PASSWORD_ENV: &str = "QBW_MASTER_PASSWORD";
-
-fn unlock_command(password: &str) -> Command {
-    let mut cmd = Command::new("bw");
-    cmd.args(["unlock", "--passwordenv", PASSWORD_ENV, "--raw"])
-        .env(PASSWORD_ENV, password)
-        .stdin(Stdio::null());
-    cmd
-}
-
-/// Overwrite a secret string before dropping it.
-fn wipe_string(s: &mut String) {
-    // SAFETY: writing zeroes keeps the bytes valid for the buffer's capacity and
-    // nothing reads the string concurrently; `clear` then drops the logical
-    // contents. `write_volatile` keeps the wipe from being optimised away.
-    unsafe {
-        for byte in s.as_bytes_mut() {
-            std::ptr::write_volatile(byte, 0);
-        }
-    }
-    s.clear();
-}
-
-/// `bw sync`: pull the latest vault from the server. `true` on success.
-pub fn bw_sync(session: Option<&str>) -> bool {
-    let mut cmd = Command::new("bw");
-    cmd.arg("sync");
-    if let Some(s) = session {
-        cmd.env("BW_SESSION", s);
-    }
-    cmd.output()
+/// `rbw sync`: pull the latest vault from the server. `true` on success.
+pub fn rbw_sync(paths: &Paths) -> bool {
+    rbw_command(paths)
+        .arg("sync")
+        .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
 }
 
-/// `bw lock`: lock the vault so the next `show` needs the master password.
-pub fn bw_lock(session: Option<&str>) -> bool {
-    let mut cmd = Command::new("bw");
-    cmd.arg("lock");
-    if let Some(s) = session {
-        cmd.env("BW_SESSION", s);
-    }
-    cmd.output()
+/// `rbw lock`: lock the database so the next `show` needs the master password.
+pub fn rbw_lock(paths: &Paths) -> bool {
+    rbw_command(paths)
+        .arg("lock")
+        .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
 }
 
-/// The parse result of one `bw list items`, before it is folded into [`State`].
+/// The parse result of one `rbw list --raw`, before it is folded into [`State`].
 struct Cache {
     menu: String,
     tsv: Vec<(String, String)>,
@@ -473,56 +462,83 @@ impl Cache {
     }
 }
 
-/// `bw list items` → cache tables. `None` when `bw` itself fails.
-fn fetch_cache(session: Option<&str>) -> Option<Cache> {
-    let mut cmd = Command::new("bw");
-    cmd.args(["list", "items"]);
-    if let Some(s) = session {
-        cmd.env("BW_SESSION", s);
-    }
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    // A stale session makes `bw list items` exit 0 with an empty stdout while
-    // it asks for the master password on stderr (stdin is closed here, so the
-    // prompt fails). Treat anything that is not a JSON array as a failed load,
-    // so callers fall back to `bw status` and prompt for the password instead
-    // of reporting an empty vault.
-    parse_cache(&out.stdout)
+/// Why a cache load could not produce entries.
+enum ListOutcome {
+    Cache(Cache),
+    Locked,
+    Unauthenticated,
+    Failed,
 }
 
-/// `refresh_cache`: rebuild the menu/tsv/password tables from `bw list items`,
+/// `rbw list --raw` → cache tables. Never prompts.
+fn fetch_cache(paths: &Paths) -> ListOutcome {
+    // `rbw list` calls `unlock()` internally, which starts the agent and opens
+    // a pinentry prompt when the vault is locked. Probe first so a background
+    // refresh cannot pop a password dialog.
+    match rbw_status(paths) {
+        VaultStatus::Unlocked => {}
+        VaultStatus::Locked => return ListOutcome::Locked,
+        VaultStatus::Unauthenticated => return ListOutcome::Unauthenticated,
+        VaultStatus::Unknown => return ListOutcome::Failed,
+    }
+
+    let out = match rbw_command(paths).args(["list", "--raw"]).output() {
+        Ok(out) => out,
+        Err(_) => return ListOutcome::Failed,
+    };
+    if !out.status.success() {
+        // A lock can land between the probe and the list; report the state that
+        // actually applies instead of a generic read error.
+        return match rbw_status(paths) {
+            VaultStatus::Locked => ListOutcome::Locked,
+            VaultStatus::Unauthenticated => ListOutcome::Unauthenticated,
+            _ => ListOutcome::Failed,
+        };
+    }
+    match parse_cache(&out.stdout) {
+        Some(cache) => ListOutcome::Cache(cache),
+        None => ListOutcome::Failed,
+    }
+}
+
+/// `refresh_cache`: rebuild the menu/tsv tables from `rbw list --raw`,
 /// stamping `last_refresh` on success so callers cannot forget to.
-/// Returns `false` when `bw` fails or its output is not a usable item array.
+/// Returns `false` when rbw fails or its output is not a usable item array.
 pub fn refresh_cache(state: &mut State, paths: &Paths) -> bool {
-    let _ = paths;
-    match fetch_cache(state.session.as_deref()) {
-        Some(cache) => {
+    match fetch_cache(paths) {
+        ListOutcome::Cache(cache) => {
             cache.apply(state);
             state.last_refresh = now_secs();
+            state.unlocked = Some(true);
             true
         }
-        None => false,
+        ListOutcome::Locked | ListOutcome::Unauthenticated => {
+            state.unlocked = Some(false);
+            false
+        }
+        ListOutcome::Failed => false,
     }
 }
 
-/// A `bw list items` running on a worker thread.
+/// A `rbw list` running on a worker thread.
 ///
 /// Refreshing on the daemon's FIFO loop would block the next `show` for the
-/// whole (multi-second) `bw` round-trip. The worker instead posts its result
-/// back, and the loop folds it in when it is ready — a `show` that arrives
-/// meanwhile is served from the warm in-memory cache instead of waiting.
+/// whole round-trip. The worker instead posts its result back, and the loop
+/// folds it in when it is ready — a `show` that arrives meanwhile is served
+/// from the warm in-memory cache instead of waiting.
 pub struct BackgroundRefresh {
     rx: Receiver<(Option<Cache>, i64)>,
 }
 
 impl BackgroundRefresh {
     /// Spawn the worker; it completes even if the receiver is dropped.
-    pub fn start(session: Option<String>) -> Self {
+    pub fn start(paths: Paths) -> Self {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let cache = fetch_cache(session.as_deref());
+            let cache = match fetch_cache(&paths) {
+                ListOutcome::Cache(cache) => Some(cache),
+                _ => None,
+            };
             let _ = tx.send((cache, now_secs()));
         });
         Self { rx }
@@ -560,15 +576,19 @@ pub fn start_refresh(state: &State, paths: &Paths) -> Option<BackgroundRefresh> 
     if state.unlocked == Some(false) {
         return None;
     }
-    Some(BackgroundRefresh::start(state.session.clone()))
+    Some(BackgroundRefresh::start(paths.clone()))
 }
 
-/// Pure `bw list items` → `(menu, tsv, id->password)` transform, matching the
-/// `jq` filters of the original script.
+/// Pure `rbw list --raw` → `(menu, tsv)` transform.
 ///
-/// Returns `None` when the output is not a JSON array (e.g. `bw` exited 0 after
-/// failing to read a master password), so the caller can distinguish "the vault
-/// is empty" from "the vault could not be read".
+/// `--raw` is used instead of `--fields id,name,user` because item names come
+/// from the vault (and can be shared in from another account): a tab or newline
+/// in a name must not break the cache the way a TSV parse would. Passwords are
+/// never part of the raw listing.
+///
+/// Returns `None` when the output is not a JSON array (e.g. rbw printed an
+/// error), so the caller can distinguish "the vault is empty" from "the vault
+/// could not be read".
 fn parse_cache(json: &[u8]) -> Option<Cache> {
     let items: Vec<Item> = serde_json::from_slice(json).ok()?;
 
@@ -576,17 +596,12 @@ fn parse_cache(json: &[u8]) -> Option<Cache> {
     let mut labels: Vec<String> = Vec::new();
 
     for item in &items {
-        if item.kind != Some(1) {
+        // rbw lists every entry type; q-bw has always offered logins only.
+        if item.kind.as_deref() != Some("Login") {
             continue;
         }
         let name = sanitize_label(&item.name.clone().unwrap_or_default());
-        let username = sanitize_label(
-            &item
-                .login
-                .as_ref()
-                .and_then(|l| l.username.clone())
-                .unwrap_or_default(),
-        );
+        let username = sanitize_label(&item.user.clone().unwrap_or_default());
 
         if !name.is_empty() {
             let label = if username.is_empty() {
@@ -622,116 +637,151 @@ fn sanitize_label(label: &str) -> String {
         .to_string()
 }
 
-/// `bw get <field> <id-or-name>`.
+/// `rbw get --field <field> -- <id-or-name>`.
 ///
-/// Used at pick time so the vault is asked for the secret with the current
-/// session, which makes a lock from another process (or from `bw` itself) take
-/// effect immediately.
-pub fn bw_get_field(session: Option<&str>, field: &str, id_or_name: &str) -> Option<String> {
-    let mut cmd = get_command(field, id_or_name);
-    if let Some(s) = session {
-        cmd.env("BW_SESSION", s);
+/// Used at pick time so the agent is asked for the secret with the current
+/// unlock state, which makes a lock from another process (or from rbw itself)
+/// take effect immediately.
+pub fn rbw_get_field(paths: &Paths, field: &str, id_or_name: &str) -> Option<String> {
+    let out = get_command(paths, field, id_or_name).output().ok()?;
+    if !out.status.success() {
+        return None;
     }
-    let out = capture_early(&mut cmd)?;
     Some(
-        String::from_utf8_lossy(&out)
+        String::from_utf8_lossy(&out.stdout)
             .trim_end_matches(['\n', '\r'])
             .to_string(),
     )
 }
 
-/// `bw get <field> -- <id-or-name>`.
+/// `rbw get --field <field> -- <id-or-name>`.
 ///
-/// A free-typed name can start with `-`; without the `--` terminator, `bw`
+/// A free-typed name can start with `-`; without the `--` terminator, rbw
 /// would parse it as an option (e.g. `--help`) instead of looking it up.
-fn get_command(field: &str, id_or_name: &str) -> Command {
-    let mut cmd = Command::new("bw");
-    cmd.args(["get", field, "--"]).arg(id_or_name);
+fn get_command(paths: &Paths, field: &str, id_or_name: &str) -> Command {
+    let mut cmd = rbw_command(paths);
+    cmd.args(["get", "--field", field, "--"]).arg(id_or_name);
     cmd
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::process::Command;
-    use std::time::{Duration, Instant};
 
-    use super::{
-        capture_early, get_command, parse_cache, unlock_command, wipe_string, PASSWORD_ENV,
-    };
+    use super::{encode_server, get_command, parse_cache, pinentry_is_shimable, rbw_path};
+    use crate::paths::Paths;
+
+    fn paths_in(base: &std::path::Path) -> Paths {
+        Paths {
+            base: base.to_path_buf(),
+            state: base.join("state"),
+            ctl: base.join("ctl"),
+            pid: base.join("pid"),
+            menu_pid: base.join("menu.pid"),
+            sel: base.join("sel"),
+            clear_after: 20,
+            refresh_interval: 30,
+        }
+    }
+
+    fn args(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
 
     #[test]
-    fn unlock_passes_the_password_via_env_not_argv() {
-        let cmd = unlock_command("s3cret");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args, ["unlock", "--passwordenv", PASSWORD_ENV, "--raw"]);
-        assert!(
-            !args.iter().any(|a| a.contains("s3cret")),
-            "the master password must never be an argument"
-        );
-
-        let envs: Vec<(String, Option<String>)> = cmd
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
+    fn get_uses_the_field_option_and_ends_option_parsing() {
+        let paths = paths_in(std::path::Path::new("/tmp/qbw-test"));
+        let cmd = get_command(&paths, "password", "--help");
         assert_eq!(
-            envs,
-            vec![(PASSWORD_ENV.to_string(), Some("s3cret".to_string()))]
+            args(&cmd),
+            ["get", "--field", "password", "--", "--help"],
+            "an item name that looks like a flag must still be looked up"
+        );
+
+        let cmd = get_command(&paths, "username", "58b1120e-48fa-4b5c-b530-b39500f1d0e7");
+        assert_eq!(
+            args(&cmd),
+            [
+                "get",
+                "--field",
+                "username",
+                "--",
+                "58b1120e-48fa-4b5c-b530-b39500f1d0e7"
+            ]
         );
     }
 
     #[test]
-    fn bw_get_terminates_options_before_the_item_name() {
-        let cmd = get_command("password", "--help");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args, ["get", "password", "--", "--help"]);
+    fn rbw_database_server_names_are_percent_encoded() {
+        assert_eq!(encode_server("default"), "default");
+        assert_eq!(
+            encode_server("https://vault.example.com"),
+            "https%3A%2F%2Fvault.example.com"
+        );
+        assert_eq!(
+            encode_server("https://vault.example.com/"),
+            "https%3A%2F%2Fvault.example.com%2F"
+        );
     }
 
     #[test]
-    fn wipe_string_zeroes_the_buffer() {
-        let mut s = String::from("master-password");
-        let len = s.len();
-        wipe_string(&mut s);
-        assert!(s.is_empty());
-        // The first `len` bytes were initialised, then overwritten with zeroes.
-        let bytes = unsafe { std::slice::from_raw_parts(s.as_ptr(), len) };
-        assert!(bytes.iter().all(|b| *b == 0));
+    fn only_the_default_pinentry_setting_uses_the_shim() {
+        assert!(pinentry_is_shimable(None), "missing setting means default");
+        assert!(
+            pinentry_is_shimable(Some("")),
+            "empty setting means default"
+        );
+        assert!(pinentry_is_shimable(Some("pinentry")));
+        // An absolute or custom program ignores PATH and would bypass q-bw.
+        assert!(!pinentry_is_shimable(Some("/usr/bin/pinentry")));
+        assert!(!pinentry_is_shimable(Some("pinentry-gtk-2")));
+    }
+
+    #[test]
+    fn rbw_path_puts_the_pinentry_shim_first() {
+        let paths = paths_in(std::path::PathBuf::from("/tmp/qbw-test").as_path());
+        let value = rbw_path(&paths);
+        let value = PathBuf::from(value);
+        let mut parts = std::env::split_paths(&value);
+        assert_eq!(parts.next().unwrap(), paths.pinentry_dir());
+        // The rest of the daemon's PATH is preserved for rbw-agent itself.
+        if let Some(old) = std::env::var_os("PATH") {
+            let old: Vec<PathBuf> = std::env::split_paths(&old).collect();
+            let rest: Vec<PathBuf> = parts.collect();
+            assert_eq!(rest, old);
+        }
     }
 
     const ITEMS: &[u8] = br#"[
-        {"type":1,"id":"id-github","name":"GitHub","login":{"username":"octocat","password":"gh-secret"}},
-        {"type":1,"id":"id-gitlab","name":"GitLab","login":{"username":"","password":"gl-secret"}},
-        {"type":1,"id":"id-nopass","name":"NoPass","login":{"username":"u","password":""}},
-        {"type":2,"id":"id-note","name":"A note","notes":"x"}
+        {"id":"id-github","name":"GitHub","user":"octocat","folder":null,"uris":["https://github.com"],"type":"Login"},
+        {"id":"id-gitlab","name":"GitLab","user":"","folder":null,"uris":null,"type":"Login"},
+        {"id":"id-nouser","name":"NoUser","user":null,"folder":null,"uris":null,"type":"Login"},
+        {"id":"id-nopass","name":"NoPass","user":"u","folder":null,"uris":null,"type":"Login"},
+        {"id":"id-note","name":"A note","user":null,"folder":null,"uris":null,"type":"Note"},
+        {"id":"id-card","name":"A card","user":null,"folder":null,"uris":null,"type":"Card"}
     ]"#;
 
     #[test]
     fn parse_cache_builds_menu_and_tsv_without_secrets() {
         let cache = parse_cache(ITEMS).expect("valid vault JSON");
 
-        assert_eq!(cache.menu, "GitHub  (octocat)\nGitLab\nNoPass  (u)");
+        assert_eq!(cache.menu, "GitHub  (octocat)\nGitLab\nNoUser\nNoPass  (u)");
         assert_eq!(
             cache.tsv,
             vec![
                 ("GitHub  (octocat)".to_string(), "id-github".to_string()),
                 ("GitLab".to_string(), "id-gitlab".to_string()),
+                ("NoUser".to_string(), "id-nouser".to_string()),
                 ("NoPass  (u)".to_string(), "id-nopass".to_string()),
             ]
         );
-        // Passwords and usernames are never part of the cache: they are fetched
-        // from `bw` when the user actually picks an item.
-        assert!(!cache.menu.contains("gh-secret"));
-        assert!(!cache.menu.contains("gl-secret"));
+        // Non-login entries are excluded, exactly like the old `type == 1`
+        // filter, and the cache never contains a password.
+        assert!(!cache.menu.contains("A note"));
+        assert!(!cache.menu.contains("A card"));
     }
 
     #[test]
@@ -744,9 +794,9 @@ mod tests {
     #[test]
     fn parse_cache_strips_control_characters_from_labels() {
         // A name shared by another user must not inject extra picker rows.
-        let json = br#"[{"type":1,"id":"id-x",
+        let json = br#"[{"type":"Login","id":"id-x",
             "name":"Evil\nName\t(X)\u001b[31m",
-            "login":{"username":"u\nser"}}]"#;
+            "user":"u\nser"}]"#;
         let cache = parse_cache(json).expect("valid vault JSON");
 
         assert!(
@@ -760,53 +810,10 @@ mod tests {
 
     #[test]
     fn parse_cache_rejects_invalid_json() {
-        // `bw list items` with a stale session exits 0 with an empty stdout,
-        // so this must be a failed load rather than an empty vault.
         assert!(parse_cache(b"").is_none());
         assert!(parse_cache(b"\n").is_none());
         assert!(parse_cache(b"not json").is_none());
         // A JSON value that is not an item array is equally unusable.
         assert!(parse_cache(b"{}").is_none());
-    }
-
-    #[test]
-    fn capture_early_returns_before_a_lingering_child_exits() {
-        // `bw` prints the value and then keeps running for ~2 s. The reader
-        // must return once the output goes quiet, not wait for the exit.
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "printf secret; exec sleep 5"]);
-
-        let start = Instant::now();
-        let out = capture_early(&mut cmd).expect("value");
-        assert_eq!(out, b"secret");
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "waited for the child to exit: {:?}",
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    fn capture_early_joins_chunks_separated_by_a_short_pause() {
-        // The quiet window must not split a value that arrives in two writes.
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "printf sec; sleep 0.05; printf ret"]);
-        assert_eq!(capture_early(&mut cmd).unwrap(), b"secret");
-    }
-
-    #[test]
-    fn capture_early_keeps_waiting_when_only_stderr_is_written() {
-        // A failed `bw get` writes "Not found." to stderr and nothing to
-        // stdout, so it must never look like a (empty) value.
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "printf boom >&2; exit 1"]);
-        assert!(capture_early(&mut cmd).is_none());
-    }
-
-    #[test]
-    fn capture_early_reads_a_value_and_a_clean_exit() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "printf value"]);
-        assert_eq!(capture_early(&mut cmd).unwrap(), b"value");
     }
 }

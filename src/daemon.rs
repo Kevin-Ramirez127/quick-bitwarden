@@ -26,8 +26,8 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 
 /// `--daemon`: run until `stop` or a termination signal.
 pub fn run_daemon(paths: &Paths) {
-    if !proc::command_exists("bw") {
-        crate::die("missing dependency: bw");
+    if !proc::command_exists("rbw") {
+        crate::die("missing dependency: rbw");
     }
 
     if let Err(e) = paths.ensure_private_dir() {
@@ -35,6 +35,16 @@ pub fn run_daemon(paths: &Paths) {
             "unsafe runtime directory {}: {e}",
             paths.base.display()
         ));
+    }
+
+    // rbw's agent runs its configured pinentry program (default `pinentry`)
+    // from PATH. A private symlink to this binary makes that q-bw's password
+    // dialog; without it the user would get rbw's terminal prompt.
+    if let Err(e) = paths.prepare_pinentry_shim() {
+        crate::die(&format!("could not install the pinentry helper: {e}"));
+    }
+    if !vault::rbw_pinentry_is_shimable() {
+        crate::die(vault::PINENTRY_HELP);
     }
 
     // Single instance: only the process that owns this lock may be the daemon.
@@ -45,6 +55,9 @@ pub fn run_daemon(paths: &Paths) {
     };
 
     cleanup_stale(paths);
+    // A session token from the `bw` version is useless to rbw and would only
+    // sit in the runtime directory forever.
+    paths.remove_legacy_session();
     // Move a hide-items marker left in the volatile runtime dir (from an older
     // version) into the durable state dir before the first picker can open.
     paths.migrate_hide_items();
@@ -53,7 +66,7 @@ pub fn run_daemon(paths: &Paths) {
     // Menu state: `"<generation> <busy>"`. The daemon bumps the generation and
     // sets `busy` in one atomic write *before* doing any work, so a concurrent
     // press can neither reuse an old generation nor slip in while the picker is
-    // still being prepared (which can take a `bw` round-trip).
+    // still being prepared (which can take an rbw round-trip).
     let mut generation: u64 = 0;
     let mut busy = false;
     proc::write_menu_state(&paths.menu_state(), generation, busy);
@@ -87,15 +100,15 @@ pub fn run_daemon(paths: &Paths) {
 
     let mut state = State::default();
     // No vault I/O at startup. The first `show` unlocks and loads the cache on
-    // demand, so starting the daemon (including `restart`) never blocks on `bw`
+    // demand, so starting the daemon (including `restart`) never blocks on rbw
     // and the control FIFO is serviced immediately.
     //
     // Periodic refreshes run on a worker thread, never on this loop, so a slow
-    // `bw list items` cannot delay the next `show`.
+    // `rbw list` cannot delay the next `show`.
     let mut refresh: Option<vault::BackgroundRefresh> = None;
-    // A `bw lock` started by `>lock` runs on a worker too, so a `show` that
+    // A `rbw lock` started by `>lock` runs on a worker too, so a `show` that
     // follows immediately can paint its loading window before the loop waits
-    // for the lock to finish (the `bw` CLI takes a second or two just to start).
+    // for the lock to finish.
     let mut pending_lock: Option<JoinHandle<bool>> = None;
 
     loop {
@@ -194,12 +207,13 @@ pub fn run_daemon(paths: &Paths) {
                         do_sync(&mut state, paths);
                     }
                     "lock" => {
-                        // A pending refresh still holds the old session; drop
-                        // it so it cannot repopulate the cache after the lock.
+                        // A pending refresh still holds the old unlock state;
+                        // drop it so it cannot repopulate the cache after the
+                        // lock.
                         refresh = None;
                         // Finish a previous lock before starting a new one.
                         finish_lock(&mut pending_lock, &mut state, paths);
-                        do_lock(&state, &mut pending_lock);
+                        do_lock(&state, paths, &mut pending_lock);
                     }
                     "stop" => break,
                     _ => {}
@@ -208,27 +222,24 @@ pub fn run_daemon(paths: &Paths) {
         }
     }
 
-    // Let an in-flight `bw lock` finish before the process goes away, but do
-    // not report anything from a shutting-down daemon. A successful lock also
-    // invalidates the stored token, so it must not survive for `restart`.
+    // Let an in-flight `rbw lock` finish before the process goes away, but do
+    // not report anything from a shutting-down daemon. A successful lock means
+    // the vault keys are gone, so they must not survive for `restart`.
     if let Some(job) = pending_lock.take() {
         if job.join().unwrap_or(false) {
-            paths.remove_session();
+            paths.remove_legacy_session();
         }
     }
 
-    // Never leave the session token in memory on the way out. The file is kept
-    // for `restart`; `stop` removes it explicitly once the daemon is gone.
-    vault::forget_session(&mut state);
     paths.remove_runtime_files();
 }
 
 /// `do_show`: pick an item, copy its password, then scrub history and schedule
 /// the clipboard clear.
 fn do_show(state: &mut State, paths: &Paths, pending_lock: &mut Option<JoinHandle<bool>>) {
-    // Open the picker before any `bw` round-trip. Its loading state is the
-    // feedback for the (multi-second) unlock/list, so it must be visible the
-    // moment the user asks for it.
+    // Open the picker before any `rbw` round-trip. Its loading state is the
+    // feedback for the unlock/list, so it must be visible the moment the user
+    // asks for it.
     let Some(mut session) = ui::start_menu(paths) else {
         return;
     };
@@ -243,15 +254,16 @@ fn do_show(state: &mut State, paths: &Paths, pending_lock: &mut Option<JoinHandl
 
         // The vault usually needs the master password after a lock. Ask for it
         // now; `prompt_and_reload` reopens the loading window as soon as the
-        // prompt closes, before the slow `bw unlock`.
+        // prompt closes, before the slow `rbw unlock` + list.
         if vault::needs_prompt(state, paths) && !prompt_and_reload(state, paths, &mut current) {
             return;
         }
 
         let mut load = vault::try_load(state, paths);
         if matches!(load, vault::Load::NeedsPassword) {
-            // The stored session was stale. Swap the loading window for the
-            // password prompt, then reopen it for the actual load.
+            // The vault was locked between the probe and the list. Swap the
+            // loading window for the password prompt, then reopen it for the
+            // actual load.
             if !prompt_and_reload(state, paths, &mut current) {
                 return;
             }
@@ -271,7 +283,7 @@ fn do_show(state: &mut State, paths: &Paths, pending_lock: &mut Option<JoinHandl
             }
             vault::Load::Unauthenticated => {
                 let _ = session.cancel();
-                ui::error_dialog(paths, "Not logged in. Run 'bw login' first.");
+                ui::error_dialog(paths, "Not logged in. Run 'rbw login' first.");
                 return;
             }
             vault::Load::Failed => {
@@ -305,8 +317,8 @@ fn do_show(state: &mut State, paths: &Paths, pending_lock: &mut Option<JoinHandl
     }
 
     // The user has chosen an item: drop whatever was on the clipboard before
-    // fetching (`bw get` can take a moment, or fail). Pasting meanwhile must not
-    // yield the previous clipboard contents.
+    // fetching (`rbw get` can take a moment, or fail). Pasting meanwhile must
+    // not yield the previous clipboard contents.
     clipboard::clear_now();
 
     // Resolve the real Bitwarden id from the row the user picked. The picker
@@ -327,7 +339,7 @@ fn do_show(state: &mut State, paths: &Paths, pending_lock: &mut Option<JoinHandl
         Err(e) => {
             let why = match e {
                 FetchError::Locked => "the vault is locked",
-                FetchError::Unauthenticated => "not logged in, run 'bw login'",
+                FetchError::Unauthenticated => "not logged in, run 'rbw login'",
                 FetchError::Failed => "could not read the vault",
             };
             ui::error_dialog(
@@ -361,48 +373,32 @@ fn do_show(state: &mut State, paths: &Paths, pending_lock: &mut Option<JoinHandl
     }
 }
 
-/// Ask for the master password and reopen the loading window before the slow
-/// `bw unlock`, so feedback returns the moment the prompt closes.
+/// Close the loading window, unlock through rbw, then reopen the loading window
+/// for the cache load.
 ///
-/// `session` is the loading window that is already open; it stays visible
-/// during the status probe and is replaced only by the prompt itself.
+/// The password dialog is shown by the pinentry shim *inside* `rbw unlock`, so
+/// the loading window is closed first (only one q-bw dialog is ever tracked),
+/// exactly where the old flow swapped windows before `bw unlock`.
 fn prompt_and_reload(
     state: &mut State,
     paths: &Paths,
     session: &mut Option<ui::MenuSession>,
 ) -> bool {
-    let request = vault::request_master_password(state, paths, || {
-        if let Some(open) = session.take() {
-            let _ = open.cancel();
-        }
-    });
-
-    match request {
-        vault::PasswordRequest::AlreadyUnlocked => true,
-        vault::PasswordRequest::Cancelled => {
-            if let Some(open) = session.take() {
-                let _ = open.cancel();
-            }
-            false
-        }
-        vault::PasswordRequest::Password(password) => {
-            // Reopen the loading window *before* `bw unlock`, not after it.
-            *session = ui::start_menu(paths);
-            if session.is_none() {
-                return false;
-            }
-            let unlocked = vault::unlock_with_password(state, paths, password);
-            if !unlocked {
-                if let Some(open) = session.take() {
-                    let _ = open.cancel();
-                }
-            }
-            unlocked
-        }
+    if let Some(open) = session.take() {
+        let _ = open.cancel();
     }
+
+    if !vault::unlock(state, paths) {
+        return false;
+    }
+
+    // Reopen the loading window as soon as the prompt closes, before the
+    // (multi-second) list that follows.
+    *session = ui::start_menu(paths);
+    session.is_some()
 }
 
-/// Wait for a `bw lock` started by `>lock` to finish and apply its result.
+/// Wait for a `rbw lock` started by `>lock` to finish and apply its result.
 fn finish_lock(job: &mut Option<JoinHandle<bool>>, state: &mut State, paths: &Paths) {
     let Some(job) = job.take() else {
         return;
@@ -411,8 +407,7 @@ fn finish_lock(job: &mut Option<JoinHandle<bool>>, state: &mut State, paths: &Pa
         ui::error_dialog(paths, "Could not lock the vault");
         return;
     }
-    paths.remove_session();
-    vault::forget_session(state);
+    paths.remove_legacy_session();
     state.menu.clear();
     state.tsv.clear();
     state.last_refresh = 0;
@@ -420,14 +415,14 @@ fn finish_lock(job: &mut Option<JoinHandle<bool>>, state: &mut State, paths: &Pa
     ui::notify("Vault locked");
 }
 
-/// `sync`: run `bw sync`, then rebuild the in-memory cache from the fresh data.
+/// `sync`: run `rbw sync`, then rebuild the in-memory cache from the fresh data.
 fn do_sync(state: &mut State, paths: &Paths) {
     if !vault::ensure_unlocked(state, paths) {
         return;
     }
     // Tell the user a sync started; a second notification follows when it ends.
-    ui::notify("Syncing vault via bw sync… you'll be notified when it ends");
-    if !vault::bw_sync(state.session.as_deref()) {
+    ui::notify("Syncing vault via rbw sync… you'll be notified when it ends");
+    if !vault::rbw_sync(paths) {
         ui::error_dialog(paths, "Could not sync the vault");
         return;
     }
@@ -435,21 +430,18 @@ fn do_sync(state: &mut State, paths: &Paths) {
     ui::notify("Vault synced");
 }
 
-/// `lock`: start `bw lock` on a worker; [`finish_lock`] forgets the session and
-/// cached items once it finishes, so a later `show` must ask for the master
-/// password again.
+/// `lock`: start `rbw lock` on a worker; [`finish_lock`] forgets the cached
+/// items once it finishes, so a later `show` must ask for the master password
+/// again.
 ///
-/// The CLI takes a second or two to start, so running it on the FIFO loop would
-/// keep a `show` issued right after `>lock` from even painting its loading
-/// window.
-fn do_lock(state: &State, job: &mut Option<JoinHandle<bool>>) {
-    let session = state.session.clone();
-    *job = Some(std::thread::spawn(move || {
-        vault::bw_lock(session.as_deref())
-    }));
+/// Running it on the FIFO loop would keep a `show` issued right after `>lock`
+/// from even painting its loading window.
+fn do_lock(_state: &State, paths: &Paths, job: &mut Option<JoinHandle<bool>>) {
+    let paths = paths.clone();
+    *job = Some(std::thread::spawn(move || vault::rbw_lock(&paths)));
 }
 
-/// Why a per-pick `bw get` failed, so the caller can show a useful message.
+/// Why a per-pick `rbw get` failed, so the caller can show a useful message.
 enum FetchError {
     Locked,
     Unauthenticated,
@@ -459,32 +451,33 @@ enum FetchError {
 /// Read one field straight from the vault.
 ///
 /// The daemon deliberately keeps no decrypted secrets between picks, so this is
-/// the point where a vault lock (from `bw` or any other client) takes effect. A
-/// stale session is retried once after the master-password dialog.
+/// the point where a vault lock (from rbw or any other client) takes effect.
+///
+/// rbw's `get` unlocks automatically, which would pop a password prompt from
+/// inside a background lookup. The state is probed first, so a locked vault is
+/// handled by q-bw's own flow instead.
 fn fetch_field(
     state: &mut State,
     paths: &Paths,
     field: &str,
     lookup: &str,
 ) -> Result<String, FetchError> {
-    if let Some(value) = vault::bw_get_field(state.session.as_deref(), field, lookup) {
-        if !value.is_empty() {
-            return Ok(value);
-        }
-    }
-
-    match vault::bw_status(state.session.as_deref()).as_str() {
-        "locked" => {
+    match vault::rbw_status(paths) {
+        vault::VaultStatus::Unlocked => match vault::rbw_get_field(paths, field, lookup) {
+            Some(value) if !value.is_empty() => Ok(value),
+            _ => Err(FetchError::Failed),
+        },
+        vault::VaultStatus::Locked => {
             if !vault::prompt_and_unlock(state, paths) {
                 return Err(FetchError::Locked);
             }
-            match vault::bw_get_field(state.session.as_deref(), field, lookup) {
+            match vault::rbw_get_field(paths, field, lookup) {
                 Some(value) if !value.is_empty() => Ok(value),
                 _ => Err(FetchError::Failed),
             }
         }
-        "unauthenticated" => Err(FetchError::Unauthenticated),
-        _ => Err(FetchError::Failed),
+        vault::VaultStatus::Unauthenticated => Err(FetchError::Unauthenticated),
+        vault::VaultStatus::Unknown => Err(FetchError::Failed),
     }
 }
 
@@ -510,7 +503,7 @@ fn short_label(selection: &str) -> String {
 /// the visible list is filtered, so it identifies the row unambiguously. The
 /// option id is the short label (needed by the hidden-list exact-name search)
 /// and therefore not unique. Custom input (a name that matched no row) has no
-/// row: the caller falls back to `bw get <typed text>`.
+/// row: the caller falls back to `rbw get <typed text>`.
 fn resolve_pick<'a>(
     tsv: &'a [(String, String)],
     sel: &r_modals::ModalSelection,
@@ -567,7 +560,7 @@ mod tests {
             Some("id-b")
         );
 
-        // A mismatched pair is not trusted: the caller falls back to `bw get`.
+        // A mismatched pair is not trusted: the caller falls back to `rbw get`.
         let tampered = selection(1, "Other", "Other", false);
         assert!(resolve_pick(&tsv, &tampered).is_none());
 

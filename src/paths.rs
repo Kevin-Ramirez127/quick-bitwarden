@@ -22,8 +22,6 @@ pub struct Paths {
     /// `~/.local/state/quick-bitwarden`) — choices that must survive a logout
     /// or reboot, such as the hide-items marker.
     pub state: PathBuf,
-    /// `$BASE/s` — Bitwarden session token.
-    pub session: PathBuf,
     /// `$BASE/ctl` — control FIFO.
     pub ctl: PathBuf,
     /// `$BASE/pid` — daemon pid.
@@ -52,7 +50,6 @@ impl Paths {
         // for this session, exactly as before.
         let state = default_state_base().unwrap_or_else(|| base.join("state"));
         Self {
-            session: base.join("s"),
             ctl: base.join("ctl"),
             pid: base.join("pid"),
             menu_pid: base.join("menu.pid"),
@@ -124,6 +121,66 @@ impl Paths {
         }
     }
 
+    /// `$BASE/bin/` — private directory holding the `pinentry` helper symlink.
+    pub fn pinentry_dir(&self) -> PathBuf {
+        self.base.join("bin")
+    }
+
+    /// `$BASE/bin/pinentry` — the shim rbw's agent runs instead of the system
+    /// pinentry, so the master password prompt is q-bw's own r-modals dialog.
+    pub fn pinentry_shim(&self) -> PathBuf {
+        self.pinentry_dir().join("pinentry")
+    }
+
+    /// `$BASE/pinentry.status` — outcome of the latest pinentry prompt.
+    ///
+    /// rbw reports every failed prompt as `pinentry cancelled`, so the helper
+    /// records whether the user cancelled or rbw asked for a retry (wrong
+    /// master password). That lets the daemon stay quiet on cancel, as before.
+    pub fn pinentry_result(&self) -> PathBuf {
+        self.base.join("pinentry.status")
+    }
+
+    /// Create (or refresh) the private `pinentry` shim symlink.
+    ///
+    /// rbw invokes the program named by its `pinentry` config key (default
+    /// `pinentry`) through `PATH`. q-bw prepends [`Paths::pinentry_dir`] for
+    /// every rbw call, so a symlink to this binary is what the agent runs.
+    pub fn prepare_pinentry_shim(&self) -> io::Result<PathBuf> {
+        let dir = self.pinentry_dir();
+        open_private_dir(&dir, true)?;
+        let link = self.pinentry_shim();
+        let exe = std::env::current_exe()?;
+
+        if std::fs::read_link(&link).ok().as_deref() == Some(exe.as_path()) {
+            return Ok(link);
+        }
+        // Replace a stale link (or a file left by an older/broken install).
+        if std::fs::symlink_metadata(&link).is_ok() {
+            std::fs::remove_file(&link)?;
+        }
+        std::os::unix::fs::symlink(&exe, &link)?;
+        Ok(link)
+    }
+
+    /// Record an outcome for [`Paths::take_pinentry_result`].
+    pub fn set_pinentry_result(&self, value: &str) {
+        let _ = write_private_file(&self.pinentry_result(), value.as_bytes());
+    }
+
+    /// Read and remove the recorded pinentry outcome.
+    pub fn take_pinentry_result(&self) -> Option<String> {
+        let value = std::fs::read_to_string(self.pinentry_result()).ok()?;
+        let _ = std::fs::remove_file(self.pinentry_result());
+        Some(value.trim().to_string())
+    }
+
+    /// Remove the legacy `$BASE/s` session-token file written by the `bw`
+    /// versions of q-bw. rbw keeps its keys in its own agent instead.
+    pub fn remove_legacy_session(&self) {
+        let _ = std::fs::remove_file(self.base.join("s"));
+    }
+
     /// `$BASE/lock` — held by the one running daemon (`flock`) for its life.
     pub fn instance_lock(&self) -> PathBuf {
         self.base.join("lock")
@@ -140,10 +197,12 @@ impl Paths {
         self.base.join("gen")
     }
 
-    /// Remove the runtime files (`ctl`, `pid`, `menu.pid`, `sel`, `gen`).
+    /// Remove the runtime files (`ctl`, `pid`, `menu.pid`, `sel`, `gen`, and a
+    /// stale pinentry outcome).
     /// The lock files are intentionally kept: `flock` is tied to the inode.
     /// Durable choices such as the hide-items marker live in [`Paths::state`]
-    /// and are not touched here.
+    /// and are not touched here. The `pinentry` shim is kept so `restart` does
+    /// not have to recreate it.
     pub fn remove_runtime_files(&self) {
         let menu_state = self.menu_state();
         let menu_state_tmp = menu_state.with_extension("tmp");
@@ -157,6 +216,7 @@ impl Paths {
         ] {
             let _ = std::fs::remove_file(p);
         }
+        let _ = std::fs::remove_file(self.pinentry_result());
     }
 
     /// Create the runtime directory if needed and refuse to use it unless it is
@@ -189,29 +249,6 @@ impl Paths {
                 md.is_file() && md.uid() == unsafe { libc::geteuid() } && md.mode() & 0o022 == 0
             })
             .unwrap_or(false)
-    }
-
-    /// Persist the session token with mode `0600`, refusing a symlinked target.
-    ///
-    /// The runtime directory is already private, but writing the strongest
-    /// credential of the vault deserves its own check: a swapped symlink must
-    /// not turn this into "write the token wherever the attacker can read it".
-    pub fn write_session(&self, token: &str) -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&self.session)?;
-        // `mode` only applies when the file is created: repair a legacy mode.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(token.as_bytes())
-    }
-
-    /// Forget the stored session token (best effort).
-    pub fn remove_session(&self) {
-        let _ = std::fs::remove_file(&self.session);
     }
 }
 
@@ -349,7 +386,6 @@ mod tests {
         Paths {
             base: base.to_path_buf(),
             state: base.join("state"),
-            session: base.join("s"),
             ctl: base.join("ctl"),
             pid: base.join("pid"),
             menu_pid: base.join("menu.pid"),
@@ -504,30 +540,40 @@ mod tests {
     }
 
     #[test]
-    fn session_token_is_private_and_never_follows_a_symlink() {
-        let base = temp_base("session");
+    fn pinentry_shim_is_private_and_points_at_this_binary() {
+        let base = temp_base("shim");
         let paths = paths_in(&base);
         paths.ensure_private_dir().unwrap();
 
-        paths.write_session("token-123").unwrap();
+        let link = paths.prepare_pinentry_shim().unwrap();
+        assert_eq!(link, paths.pinentry_shim());
         assert_eq!(
-            std::fs::metadata(&paths.session).unwrap().mode() & 0o777,
-            0o600
+            std::fs::metadata(paths.pinentry_dir()).unwrap().mode() & 0o777,
+            0o700,
+            "the shim directory must be private"
         );
         assert_eq!(
-            std::fs::read_to_string(&paths.session).unwrap(),
-            "token-123"
+            std::fs::read_link(&link).unwrap(),
+            std::env::current_exe().unwrap()
         );
 
-        paths.remove_session();
-        assert!(!paths.session.exists());
+        // Running it again keeps the same link instead of failing.
+        assert_eq!(paths.prepare_pinentry_shim().unwrap(), link);
 
-        // A planted symlink must not become a token exfiltration channel.
-        let target = base.join("target");
-        std::fs::write(&target, b"keep").unwrap();
-        std::os::unix::fs::symlink(&target, &paths.session).unwrap();
-        assert!(paths.write_session("leak").is_err());
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_session_file_is_removed_without_touching_other_files() {
+        let base = temp_base("legacy-session");
+        let paths = paths_in(&base);
+        paths.ensure_private_dir().unwrap();
+        std::fs::write(base.join("s"), b"old-token").unwrap();
+        std::fs::write(base.join("keep"), b"keep").unwrap();
+
+        paths.remove_legacy_session();
+        assert!(!base.join("s").exists());
+        assert!(base.join("keep").exists());
 
         let _ = std::fs::remove_dir_all(&base);
     }
