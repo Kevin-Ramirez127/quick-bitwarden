@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 //! quick-bitwarden — copy Bitwarden passwords from a daemon-backed picker.
 
 mod clipboard;

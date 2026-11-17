@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 //! Runtime paths and tunables, mirroring the shell variables of the original.
 
 use std::fs::OpenOptions;

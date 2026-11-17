@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 //! Shell-free helpers: executable lookup, pid handling and the control FIFO.
 
 use std::ffi::CString;

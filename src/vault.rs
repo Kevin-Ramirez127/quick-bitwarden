@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 //! Bitwarden CLI access: unlocking, the in-memory cache and password lookup.
 
 use std::io::Read;

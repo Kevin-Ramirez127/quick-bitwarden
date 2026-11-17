@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 //! Clipboard writing/clearing and `cliphist` hygiene.
 
 use std::io::Write;
